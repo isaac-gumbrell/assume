@@ -1,0 +1,4 @@
+line,bus0,bus1,s_nom,s_max_pu,s_nom_forward,s_nom_reverse,x,r
+Line_N_C,north,centre,500.0,1,500.0,300.0,0.01,0.001
+Line_C_S,centre,south,400.0,1,400.0,250.0,0.01,0.001
+Line_N_S,north,south,300.0,1,300.0,200.0,0.01,0.001

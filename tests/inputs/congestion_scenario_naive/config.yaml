@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: ASSUME Developers
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# --------------------------------------------------------------------------
+# Congestion Scenario – Stage 1: Naive Baseline
+# --------------------------------------------------------------------------
+# All units bid at SRMC (naive strategies).
+# Complex clearing with log_flows: true produces grid_flows output.
+# After running, convert grid_flows → congestion_df.csv using
+# assume.common.grid_utils.read_congestion_from_results()
+# --------------------------------------------------------------------------
+
+naive_baseline:
+  start_date: 2019-01-01 00:00
+  end_date: 2019-01-02 00:00
+  time_step: 1h
+  save_frequency_hours: 24
+
+  markets_config:
+    EOM:
+      start_date: 2019-01-01 00:00
+      operator: EOM_operator
+      product_type: energy
+      products:
+        - duration: 1h
+          count: 24
+          first_delivery: 1h
+      opening_frequency: 24h
+      opening_duration: 1h
+      volume_unit: MWh
+      maximum_bid_volume: 100000
+      maximum_bid_price: 3000
+      minimum_bid_price: -500
+      price_unit: EUR/MWh
+      market_mechanism: complex_clearing
+      additional_fields:
+        - node
+        - max_power
+      param_dict:
+        network_path: .
+        solver: highs
+        zones_identifier: zone_id
+        pricing_mechanism: pay_as_clear
+        log_flows: true

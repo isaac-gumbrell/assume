@@ -374,3 +374,113 @@ def get_supported_solver_linopy(default_solver: str | None = None):
         solver = solvers[0]
 
     return solver
+
+
+# ---------------------------------------------------------------------------
+# Grid-flow → congestion-signal conversion
+# ---------------------------------------------------------------------------
+
+
+def flows_to_congestion_df(
+    flows_df: pd.DataFrame,
+    lines_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Convert raw grid-flow results into signed, directional congestion signals.
+
+    Parameters
+    ----------
+    flows_df : pd.DataFrame
+        Grid-flows table as stored by ``OutputRole``.  Expected columns:
+        ``line`` (str) and ``flow`` (float), with a ``DatetimeIndex``.
+    lines_df : pd.DataFrame
+        Network line definitions with at least ``s_nom`` and optionally
+        ``s_nom_forward``, ``s_nom_reverse``, ``s_max_pu``.  Index = line id.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``{line_id}_line_congestion_signal`` for every line,
+        values in [-1, 1].  Positive = flow in line orientation (bus0→bus1),
+        negative = counterflow.  Ready to be saved as ``congestion_df.csv``
+        and loaded by the CSV scenario loader.
+    """
+    if flows_df.empty or lines_df.empty:
+        return pd.DataFrame()
+
+    # Pivot so each line is a column, index is datetime
+    if "line" in flows_df.columns and "flow" in flows_df.columns:
+        pivoted = flows_df.pivot_table(
+            index=flows_df.index, columns="line", values="flow", aggfunc="first"
+        )
+    else:
+        pivoted = flows_df
+
+    congestion = pd.DataFrame(index=pivoted.index)
+
+    for line_id in pivoted.columns:
+        if line_id not in lines_df.index:
+            continue
+
+        line = lines_df.loc[line_id]
+        s_max_pu = line.get("s_max_pu", 1.0)
+        if pd.isna(s_max_pu):
+            s_max_pu = 1.0
+
+        if "s_nom_forward" in lines_df.columns and not pd.isna(
+            line.get("s_nom_forward")
+        ):
+            cap_forward = float(line["s_nom_forward"])
+        else:
+            cap_forward = float(line["s_nom"]) * float(s_max_pu)
+
+        if "s_nom_reverse" in lines_df.columns and not pd.isna(
+            line.get("s_nom_reverse")
+        ):
+            cap_reverse = float(line["s_nom_reverse"])
+        else:
+            cap_reverse = float(line["s_nom"]) * float(s_max_pu)
+
+        flow = pivoted[line_id].values.astype(float)
+
+        signal = np.where(
+            flow >= 0,
+            np.where(cap_forward > 0, flow / cap_forward, 0.0),
+            np.where(cap_reverse > 0, flow / -cap_reverse, 0.0) * -1.0,
+        )
+        signal = np.clip(signal, -1.0, 1.0)
+
+        congestion[f"{line_id}_line_congestion_signal"] = signal
+
+    return congestion
+
+
+def read_congestion_from_results(
+    output_path,
+    network_path,
+) -> pd.DataFrame:
+    """Read ``grid_flows.csv`` + ``lines.csv`` and return a congestion DataFrame.
+
+    Parameters
+    ----------
+    output_path : str or Path
+        Directory containing ``grid_flows.csv`` (simulation output directory).
+    network_path : str or Path
+        Directory containing ``lines.csv`` (scenario input directory).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``{line_id}_line_congestion_signal`` for every line.
+    """
+    from pathlib import Path
+
+    output_path = Path(output_path)
+    network_path = Path(network_path)
+
+    flows_df = pd.read_csv(
+        output_path / "grid_flows.csv", parse_dates=True, index_col=0
+    )
+    flows_df.index.name = "datetime"
+    lines_df = pd.read_csv(network_path / "lines.csv", index_col=0)
+
+    return flows_to_congestion_df(flows_df, lines_df)

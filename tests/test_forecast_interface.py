@@ -23,6 +23,7 @@ from assume.common.forecaster import (
     DemandForecaster,
     DsmUnitForecaster,
     PowerplantForecaster,
+    UnitForecaster,
 )
 from assume.common.market_objects import MarketConfig, MarketProduct
 from assume.strategies import EnergyHeuristicElasticStrategy, EnergyNaiveStrategy
@@ -344,6 +345,67 @@ def test_forecast_interface__empty_grid(market_setup, forecast_setup):
 
     assert mock_dsm_forecaster.congestion_signal == {}
     assert mock_dsm_forecaster.renewable_utilisation_signal == {}
+
+
+def test_forecast_interface__directional_line_congestion(
+    index, market_setup, forecast_setup
+):
+    forecast_df = pd.DataFrame(index=index)
+    forecast_df["Line_N_N_line_congestion_signal"] = np.concatenate(
+        [np.full(12, 0.8), np.full(12, -0.6)]
+    )
+
+    unit_forecaster = UnitForecaster(
+        index=FastIndex(start=index[0], end=index[-1], freq=pd.infer_freq(index)),
+        forecast_registries=get_forecast_registries(),
+        forecast_algorithms={
+            "price": "price_keep_given",
+            "residual_load": "residual_load_keep_given",
+            "line_congestion_signal": "line_congestion_signal_naive_forecast",
+        },
+    )
+
+    unit_forecaster.initialize(
+        list(forecast_setup["units"]),
+        market_setup["market_configs"],
+        forecast_df,
+        None,
+    )
+
+    line_signal = unit_forecaster.line_congestion_signal[
+        "Line_N_N_line_congestion_signal"
+    ]
+    assert np.isclose(line_signal.data[:12], 0.8).all()
+    assert np.isclose(line_signal.data[12:], -0.6).all()
+
+    local_congestion = unit_forecaster.local_line_congestion
+    assert np.isclose(
+        local_congestion["north_1_export_congestion"].data[:12], 0.8
+    ).all()
+    assert np.isclose(
+        local_congestion["north_1_import_congestion"].data[:12], 0.0
+    ).all()
+
+    assert np.isclose(
+        local_congestion["north_1_export_congestion"].data[12:], 0.0
+    ).all()
+    assert np.isclose(
+        local_congestion["north_1_import_congestion"].data[12:], 0.6
+    ).all()
+
+    assert np.isclose(
+        local_congestion["north_2_export_congestion"].data[:12], 0.0
+    ).all()
+    assert np.isclose(
+        local_congestion["north_2_import_congestion"].data[:12], 0.8
+    ).all()
+
+    assert np.isclose(
+        local_congestion["north_2_export_congestion"].data[12:], 0.6
+    ).all()
+    assert np.isclose(
+        local_congestion["north_2_import_congestion"].data[12:], 0.0
+    ).all()
 
 
 def test_forecast_interface__elastic_demand(index, market_setup, forecast_setup):

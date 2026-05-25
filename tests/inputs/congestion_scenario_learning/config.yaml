@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: ASSUME Developers
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# --------------------------------------------------------------------------
+# Congestion Scenario – Stage 2: Learning with Congestion Observations
+# --------------------------------------------------------------------------
+# Learning agents receive congestion-only observations (no price info).
+# Three policy types: energy (single bid), storage, renewable compatible
+# All share obs_dim so they can use a centralised MATD3 critic.
+#
+# Requires congestion_df.csv in this directory (from stage 1 conversion).
+# --------------------------------------------------------------------------
+
+learning_congestion:
+  start_date: 2019-01-01 00:00
+  end_date: 2019-01-02 00:00
+  time_step: 1h
+  save_frequency_hours: 24
+
+  bidding_strategy_params:
+    foresight: 24
+    act_dim: 1
+    include_residual_load_observation: true
+    include_price_forecast_observation: false
+    include_price_history_observation: false
+    include_local_line_congestion_observation: true
+
+  learning_config:
+    learning_mode: true
+    continue_learning: false
+    max_bid_price: 100
+    algorithm: matd3
+    learning_rate: 0.001
+    training_episodes: 5
+    episodes_collecting_initial_experience: 1
+    train_freq: 24h
+    gradient_steps: 5
+    batch_size: 32
+    gamma: 0.99
+    device: cpu
+    noise_sigma: 0.1
+    noise_scale: 1
+    noise_dt: 1
+    validation_episodes_interval: 2
+
+  markets_config:
+    EOM:
+      start_date: 2019-01-01 00:00
+      operator: EOM_operator
+      product_type: energy
+      products:
+        - duration: 1h
+          count: 24
+          first_delivery: 1h
+      opening_frequency: 24h
+      opening_duration: 1h
+      volume_unit: MWh
+      maximum_bid_volume: 100000
+      maximum_bid_price: 3000
+      minimum_bid_price: -500
+      price_unit: EUR/MWh
+      market_mechanism: complex_clearing
+      additional_fields:
+        - node
+        - max_power
+      param_dict:
+        network_path: .
+        solver: highs
+        zones_identifier: zone_id
+        pricing_mechanism: pay_as_clear
+        log_flows: true

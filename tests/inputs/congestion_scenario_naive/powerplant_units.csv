@@ -1,0 +1,7 @@
+name,technology,bidding_EOM,fuel_type,emission_factor,max_power,min_power,efficiency,additional_cost,node,unit_operator
+pp_north_1,nuclear,powerplant_energy_naive,uranium,0.0,800.0,0,0.33,2,north,Operator_N
+pp_north_2,lignite,powerplant_energy_naive,lignite,0.9,600.0,0,0.40,3,north,Operator_N
+pp_centre_1,hard coal,powerplant_energy_naive,hard coal,0.8,400.0,0,0.39,4,centre,Operator_C
+pp_centre_2,natural gas,powerplant_energy_naive,natural gas,0.4,300.0,0,0.55,5,centre,Operator_C
+pp_south_1,natural gas,powerplant_energy_naive,natural gas,0.4,500.0,0,0.50,6,south,Operator_S
+pp_south_2,oil,powerplant_energy_naive,oil,0.6,400.0,0,0.38,8,south,Operator_S

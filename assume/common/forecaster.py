@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, TypeAlias
 
+import numpy as np
 import pandas as pd
 
 from assume.common.exceptions import ValidationError
@@ -105,8 +106,8 @@ def calculate_node_wise_forecasts(
 
     forecast = forecast_algorithm(
         index,
-        units,
-        market_configs,
+        tuple(units),
+        tuple(market_configs),
         preprocess_information,
     )
 
@@ -135,6 +136,44 @@ def calculate_node_wise_forecasts(
         and forecast.get(f"all_nodes_{prefix_alias}") is not None
     ):
         forecast[f"all_nodes_{prefix_alias}"] = forecast_df[f"all_nodes_{prefix}"]
+
+    return forecast
+
+
+def calculate_line_wise_forecasts(
+    index: ForecastIndex,
+    units: list[BaseUnit],
+    market_configs: list[MarketConfig],
+    forecast_algorithm: Callable,
+    forecast_df: ForecastSeries = None,
+    preprocess_information=None,
+    prefix="",
+):
+    """Compute per-line forecasts for spatial metrics (e.g. directional line congestion)."""
+    forecast_df = _ensure_not_none(forecast_df, index)
+
+    forecast = forecast_algorithm(
+        index,
+        tuple(units),
+        tuple(market_configs),
+        preprocess_information,
+    )
+
+    lines = pd.DataFrame()
+    for market_config in market_configs:
+        grid_data = market_config.param_dict.get("grid_data", {})
+        candidate_lines = grid_data.get("lines", pd.DataFrame())
+        if isinstance(candidate_lines, pd.DataFrame) and not candidate_lines.empty:
+            lines = candidate_lines
+            break
+
+    if lines.empty:
+        return forecast
+
+    for line_id in lines.index:
+        line_key = f"{line_id}_{prefix}"
+        if forecast_df.get(line_key) is not None and forecast.get(line_key) is not None:
+            forecast[line_key] = forecast_df[line_key]
 
     return forecast
 
@@ -199,7 +238,70 @@ class UnitForecaster:
         self.residual_load: dict[str, ForecastSeries] = self._dict_to_series(
             residual_load
         )
+        self.line_congestion_signal: dict[str, ForecastSeries] = {}
+        self.local_line_congestion: dict[str, ForecastSeries] = {}
         self.preprocess_information = {}
+
+    def _extract_lines(self, market_configs: list[MarketConfig]) -> pd.DataFrame:
+        for market_config in market_configs:
+            grid_data = market_config.param_dict.get("grid_data", {})
+            lines = grid_data.get("lines", pd.DataFrame())
+            if isinstance(lines, pd.DataFrame) and not lines.empty:
+                return lines
+        return pd.DataFrame()
+
+    def _derive_local_line_congestion(
+        self, market_configs: list[MarketConfig]
+    ) -> dict[str, FastSeries]:
+        lines = self._extract_lines(market_configs)
+        if lines.empty or not self.line_congestion_signal:
+            return {}
+
+        node_to_export_series: dict[str, list[FastSeries]] = {}
+        node_to_import_series: dict[str, list[FastSeries]] = {}
+
+        for line_id, line_data in lines.iterrows():
+            signal_key = f"{line_id}_line_congestion_signal"
+            line_signal = self.line_congestion_signal.get(signal_key)
+            if line_signal is None:
+                continue
+
+            bus0 = line_data["bus0"]
+            bus1 = line_data["bus1"]
+
+            export_bus0 = self._to_series(np.maximum(line_signal.data, 0.0))
+            import_bus0 = self._to_series(np.maximum(-line_signal.data, 0.0))
+
+            export_bus1 = self._to_series(np.maximum(-line_signal.data, 0.0))
+            import_bus1 = self._to_series(np.maximum(line_signal.data, 0.0))
+
+            node_to_export_series.setdefault(bus0, []).append(export_bus0)
+            node_to_import_series.setdefault(bus0, []).append(import_bus0)
+
+            node_to_export_series.setdefault(bus1, []).append(export_bus1)
+            node_to_import_series.setdefault(bus1, []).append(import_bus1)
+
+        local_congestion: dict[str, FastSeries] = {}
+
+        all_nodes = set(node_to_export_series) | set(node_to_import_series)
+        for node in all_nodes:
+            node_export = node_to_export_series.get(node, [])
+            node_import = node_to_import_series.get(node, [])
+
+            if node_export:
+                export_max = np.max([series.data for series in node_export], axis=0)
+            else:
+                export_max = np.zeros(len(self.index))
+
+            if node_import:
+                import_max = np.max([series.data for series in node_import], axis=0)
+            else:
+                import_max = np.zeros(len(self.index))
+
+            local_congestion[f"{node}_export_congestion"] = self._to_series(export_max)
+            local_congestion[f"{node}_import_congestion"] = self._to_series(import_max)
+
+        return local_congestion
 
     def _to_series(self, item: ForecastSeries) -> FastSeries:
         """Wrap *item* in a ``FastSeries`` aligned to ``self.index`` (no-op if already one)."""
@@ -255,6 +357,18 @@ class UnitForecaster:
         )
         self.preprocess_information["residual_load"] = (
             residual_load_preprocess_algorithm(
+                self.index, units, market_configs, forecast_df, initializing_unit
+            )
+        )
+
+        line_congestion_preprocess_algorithm_name = self.forecast_algorithms.get(
+            "preprocess_line_congestion_signal", "line_congestion_signal_default"
+        )
+        line_congestion_preprocess_algorithm = self._registries["preprocess"].get(
+            line_congestion_preprocess_algorithm_name
+        )
+        self.preprocess_information["line_congestion_signal"] = (
+            line_congestion_preprocess_algorithm(
                 self.index, units, market_configs, forecast_df, initializing_unit
             )
         )
@@ -324,6 +438,28 @@ class UnitForecaster:
             )
             self.residual_load = self._dict_to_series(self.residual_load)
 
+        line_congestion_forecast_algorithm_name = self.forecast_algorithms.get(
+            "line_congestion_signal", "line_congestion_signal_naive_forecast"
+        )
+        line_congestion_forecast_algorithm = self._registries["init"].get(
+            line_congestion_forecast_algorithm_name
+        )
+        if line_congestion_forecast_algorithm is not None:
+            self.line_congestion_signal = calculate_line_wise_forecasts(
+                self.index,
+                units,
+                market_configs,
+                line_congestion_forecast_algorithm,
+                forecast_df,
+                self.preprocess_information["line_congestion_signal"],
+                prefix="line_congestion_signal",
+            )
+            self.line_congestion_signal = self._dict_to_series(
+                self.line_congestion_signal
+            )
+
+        self.local_line_congestion = self._derive_local_line_congestion(market_configs)
+
     def update(self, *args, **kwargs):
         """Revise forecast timeseries during runtime (e.g. during bid calculation).
 
@@ -362,6 +498,26 @@ class UnitForecaster:
             **kwargs,
         )
         self.residual_load = self._dict_to_series(self.residual_load)
+
+        line_congestion_update_algorithm_name = self.forecast_algorithms.get(
+            "update_line_congestion_signal", "line_congestion_signal_default"
+        )
+        line_congestion_update_algorithm = self._registries["update"].get(
+            line_congestion_update_algorithm_name
+        )
+        self.line_congestion_signal = line_congestion_update_algorithm(
+            self.line_congestion_signal,
+            self.preprocess_information["line_congestion_signal"],
+            *args,
+            **kwargs,
+        )
+        self.line_congestion_signal = self._dict_to_series(self.line_congestion_signal)
+
+        market_configs = kwargs.get("market_configs")
+        if market_configs is not None:
+            self.local_line_congestion = self._derive_local_line_congestion(
+                market_configs
+            )
 
 
 class CustomUnitForecaster(UnitForecaster):

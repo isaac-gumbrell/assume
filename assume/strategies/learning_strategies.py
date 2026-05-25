@@ -31,6 +31,38 @@ class TorchLearningStrategy(LearningStrategy):
     A strategy to enable machine learning with pytorch.
     """
 
+    @staticmethod
+    def resolve_observation_config(kwargs: dict) -> dict:
+        """Resolve observation feature flags and derived shared timeseries dimension."""
+        include_residual = kwargs.pop("include_residual_load_observation", True)
+        include_price_forecast = kwargs.pop("include_price_forecast_observation", True)
+        include_price_history = kwargs.pop("include_price_history_observation", True)
+        include_local_line_congestion = kwargs.pop(
+            "include_local_line_congestion_observation", False
+        )
+
+        shared_timeseries_dim = (
+            int(include_residual)
+            + int(include_price_forecast)
+            + int(include_price_history)
+        )
+        if include_local_line_congestion:
+            shared_timeseries_dim += 2
+
+        if shared_timeseries_dim <= 0:
+            raise ValueError(
+                "At least one shared observation channel must be enabled. "
+                "Please enable one of residual load, price forecast, price history, or local line congestion observations."
+            )
+
+        return {
+            "include_residual_load_observation": include_residual,
+            "include_price_forecast_observation": include_price_forecast,
+            "include_price_history_observation": include_price_history,
+            "include_local_line_congestion_observation": include_local_line_congestion,
+            "num_timeseries_obs_dim": shared_timeseries_dim,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -114,28 +146,44 @@ class TorchLearningStrategy(LearningStrategy):
         self.actor.eval()  # set the actor to evaluation mode
 
     def prepare_observations(self, unit, market_id):
-        # scaling factors for the observations
-        # Note: These scaling factors could be interpreted as information leakage. However as we are in a simulation environment and not a purley forecasting setting
-        # we assume that the agent has access to this information already
-        upper_scaling_factor_price = max(unit.forecaster.price[market_id])
-        lower_scaling_factor_price = min(unit.forecaster.price[market_id])
-        residual_load = unit.forecaster.residual_load.get(
-            market_id, FastSeries(index=unit.index, value=0)
-        )
-        upper_scaling_factor_res_load = max(residual_load)
-        lower_scaling_factor_res_load = min(residual_load)
+        if self.include_price_forecast_observation:
+            upper_scaling_factor_price = max(unit.forecaster.price[market_id])
+            lower_scaling_factor_price = min(unit.forecaster.price[market_id])
+            self.scaled_prices_obs = min_max_scale(
+                unit.forecaster.price[market_id],
+                lower_scaling_factor_price,
+                upper_scaling_factor_price,
+            )
 
-        self.scaled_res_load_obs = min_max_scale(
-            residual_load,
-            lower_scaling_factor_res_load,
-            upper_scaling_factor_res_load,
+        if self.include_residual_load_observation:
+            residual_load = unit.forecaster.residual_load.get(
+                market_id, FastSeries(index=unit.index, value=0)
+            )
+            upper_scaling_factor_res_load = max(residual_load)
+            lower_scaling_factor_res_load = min(residual_load)
+            self.scaled_res_load_obs = min_max_scale(
+                residual_load,
+                lower_scaling_factor_res_load,
+                upper_scaling_factor_res_load,
+            )
+
+    def _get_local_directional_congestion_observations(self, unit, start):
+        local_line_congestion = getattr(unit.forecaster, "local_line_congestion", {})
+
+        import_key = f"{unit.node}_import_congestion"
+        export_key = f"{unit.node}_export_congestion"
+
+        import_series = local_line_congestion.get(
+            import_key, FastSeries(index=unit.index, value=0.0)
+        )
+        export_series = local_line_congestion.get(
+            export_key, FastSeries(index=unit.index, value=0.0)
         )
 
-        self.scaled_prices_obs = min_max_scale(
-            unit.forecaster.price[market_id],
-            lower_scaling_factor_price,
-            upper_scaling_factor_price,
-        )
+        import_obs = import_series.window(start, self.foresight, direction="forward")
+        export_obs = export_series.window(start, self.foresight, direction="forward")
+
+        return import_obs, export_obs
 
     def create_observation(
         self, unit: BaseUnit, market_id: str, start: datetime, end: datetime
@@ -167,8 +215,12 @@ class TorchLearningStrategy(LearningStrategy):
         """
 
         # ensure scaled observations are prepared
-        if not hasattr(self, "scaled_res_load_obs") or not hasattr(
-            self, "scaled_prices_obs"
+        if (
+            self.include_residual_load_observation
+            and not hasattr(self, "scaled_res_load_obs")
+        ) or (
+            self.include_price_forecast_observation
+            and not hasattr(self, "scaled_prices_obs")
         ):
             self.prepare_observations(unit, market_id)
 
@@ -177,22 +229,37 @@ class TorchLearningStrategy(LearningStrategy):
         # =============================================================================
 
         # --- 1. Forecasted residual load and price (forward-looking) ---
-        scaled_res_load_forecast = self.scaled_res_load_obs.window(
-            start, self.foresight, direction="forward"
-        )
-        scaled_price_forecast = self.scaled_prices_obs.window(
-            start, self.foresight, direction="forward"
-        )
+        shared_observations = []
+
+        if self.include_residual_load_observation:
+            scaled_res_load_forecast = self.scaled_res_load_obs.window(
+                start, self.foresight, direction="forward"
+            )
+            shared_observations.append(scaled_res_load_forecast)
+
+        if self.include_price_forecast_observation:
+            scaled_price_forecast = self.scaled_prices_obs.window(
+                start, self.foresight, direction="forward"
+            )
+            shared_observations.append(scaled_price_forecast)
 
         # --- 2. Historical actual prices (backward-looking) ---
         # Note: We scale with the max_bid_price here in comparison to the scaling of the forecast where we use the max price of the forecast period
         # this is not consistent but has worked well so far. Future work could look into this in more detail.
-        scaled_price_history = (
-            unit.outputs["energy_accepted_price"].window(
-                start, self.foresight, direction="backward"
+        if self.include_price_history_observation:
+            scaled_price_history = (
+                unit.outputs["energy_accepted_price"].window(
+                    start, self.foresight, direction="backward"
+                )
+                / self.max_bid_price
             )
-            / self.max_bid_price
-        )
+            shared_observations.append(scaled_price_history)
+
+        if self.include_local_line_congestion_observation:
+            import_congestion, export_congestion = (
+                self._get_local_directional_congestion_observations(unit, start)
+            )
+            shared_observations.extend([import_congestion, export_congestion])
 
         # --- 3. Individual observations ---
         individual_observations = self.get_individual_observations(unit, start, end)
@@ -200,9 +267,7 @@ class TorchLearningStrategy(LearningStrategy):
         # concat all observations into one array
         observation = np.concatenate(
             [
-                scaled_res_load_forecast,
-                scaled_price_forecast,
-                scaled_price_history,
+                *shared_observations,
                 individual_observations,
             ]
         )
@@ -378,13 +443,27 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         foresight = kwargs.pop("foresight", 12)
         act_dim = kwargs.pop("act_dim", 2)
         unique_obs_dim = kwargs.pop("unique_obs_dim", 2)
+        observation_config = self.resolve_observation_config(kwargs)
         super().__init__(
             foresight=foresight,
             act_dim=act_dim,
             unique_obs_dim=unique_obs_dim,
+            num_timeseries_obs_dim=observation_config["num_timeseries_obs_dim"],
             *args,
             **kwargs,
         )
+        self.include_residual_load_observation = observation_config[
+            "include_residual_load_observation"
+        ]
+        self.include_price_forecast_observation = observation_config[
+            "include_price_forecast_observation"
+        ]
+        self.include_price_history_observation = observation_config[
+            "include_price_history_observation"
+        ]
+        self.include_local_line_congestion_observation = observation_config[
+            "include_local_line_congestion_observation"
+        ]
 
     def calculate_bids(
         self,
@@ -857,13 +936,27 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         foresight = kwargs.pop("foresight", 24)
         act_dim = kwargs.pop("act_dim", 1)
         unique_obs_dim = kwargs.pop("unique_obs_dim", 2)
+        observation_config = self.resolve_observation_config(kwargs)
         super().__init__(
             foresight=foresight,
             act_dim=act_dim,
             unique_obs_dim=unique_obs_dim,
+            num_timeseries_obs_dim=observation_config["num_timeseries_obs_dim"],
             *args,
             **kwargs,
         )
+        self.include_residual_load_observation = observation_config[
+            "include_residual_load_observation"
+        ]
+        self.include_price_forecast_observation = observation_config[
+            "include_price_forecast_observation"
+        ]
+        self.include_price_history_observation = observation_config[
+            "include_price_history_observation"
+        ]
+        self.include_local_line_congestion_observation = observation_config[
+            "include_local_line_congestion_observation"
+        ]
 
     def get_individual_observations(
         self, unit: SupportsMinMaxCharge, start: datetime, end: datetime

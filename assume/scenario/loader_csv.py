@@ -602,6 +602,19 @@ def load_config_and_create_forecaster(
     forecasts_df = load_file(
         path=path, config=config, file_name="forecasts_df", index=index
     )
+    congestion_df = load_file(
+        path=path, config=config, file_name="congestion_df", index=index
+    )
+    if congestion_df is not None:
+        if forecasts_df is None:
+            forecasts_df = pd.DataFrame(index=index)
+
+        overlapping_columns = forecasts_df.columns.intersection(congestion_df.columns)
+        if len(overlapping_columns) > 0:
+            forecasts_df = forecasts_df.drop(columns=overlapping_columns)
+
+        forecasts_df = pd.concat([forecasts_df, congestion_df], axis=1)
+
     demand_df = load_file(path=path, config=config, file_name="demand_df", index=index)
     if demand_df is None:
         # no demand timeseries exist, all demand is elastic. Fill missing demand timeseries with zeros and raise a warning.
