@@ -5,6 +5,7 @@
 import calendar
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -21,8 +22,9 @@ from assume.common.utils import (
     datetime2timestamp,
     get_available_products,
     get_products_index,
-    get_supported_solver,
+    get_supported_solver_pyomo,
     initializer,
+    load_index_file,
     parse_duration,
     plot_orderbook,
     separate_orders,
@@ -813,14 +815,36 @@ def test_parse_duration():
 
 
 def test_solver_available():
-    assert get_supported_solver() == "appsi_highs"
-    assert get_supported_solver("unknown_solver") == "appsi_highs"
+    assert get_supported_solver_pyomo() == "appsi_highs"
+    assert get_supported_solver_pyomo("unknown_solver") == "appsi_highs"
 
 
 def test_solver_unavailable(monkeypatch):
     monkeypatch.setattr("assume.common.utils.check_available_solvers", lambda *args: [])
     with pytest.raises(RuntimeError):
-        get_supported_solver()
+        get_supported_solver_pyomo()
+
+
+def test_load_index_file():
+    path = Path("./tests/fixtures/forecast_init/demand_df.csv")
+
+    index = pd.date_range("2019-01-01 8:00", periods=3, freq="h")
+    df = load_index_file(path, index)
+    assert len(df) == 3
+
+    index = pd.date_range("2019-01-01 8:00", periods=7, freq="h")
+    df = load_index_file(path, index)
+    assert len(df) == 7
+
+    index = pd.date_range("2019-01-01 8:00", periods=12, freq="h")
+    df = load_index_file(path, index)
+    assert df is None
+
+    invalid_path = Path("./tests/fixtures/forecast_init/invalid")
+
+    index = pd.date_range("2019-01-01", periods=36, freq="h")
+    df = load_index_file(invalid_path, index)
+    assert df is None
 
 
 if __name__ == "__main__":

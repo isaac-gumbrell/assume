@@ -29,6 +29,26 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def is_elastic_demand(unit, market_config=None) -> bool:
+    """
+    Checks whether a unit as an elastic demand.
+    NOTE: There is currently not a clear flag whether some demand is elastic.
+          Until then, it is defined via its bidding strategy on a given market.
+          If no market given we use the same criterion the Demand class uses itself:
+            unit.elasticity_model != 0
+    """
+    if market_config is not None:
+        return isinstance(
+            unit.bidding_strategies[market_config.market_id],
+            EnergyHeuristicElasticStrategy,
+        )
+
+    if isinstance(unit, Demand):
+        return unit.elasticity_model != 0
+
+    return False
+
+
 def calculate_max_power(units, index=None):
     """
     Returns: max available power: shape (num_units, forecast_len)
@@ -76,9 +96,17 @@ def calculate_sum_demand(
     Returns summed demand at every timestep (incl. imports and exports)
     Shape: (num_timesteps,)
     """
-    sum_demand = abs(np.array([unit.forecaster.demand for unit in demand_units])).sum(
-        axis=0
-    )
+    sum_demand = np.zeros(len(demand_units[0].forecaster.index))
+
+    sum_demand += abs(
+        np.array(
+            [
+                unit.forecaster.demand
+                for unit in demand_units
+                if not is_elastic_demand(unit)
+            ]
+        )
+    ).sum(axis=0)
 
     return sum_demand + calculate_exchange_volume(exchange_units)
 
@@ -257,56 +285,52 @@ def calculate_naive_price_elastic(
 
     # clear the market forecast including elastic demand bids using the PayAsClearRole
     for t in index:
-        # get the supply offers
+        # get the supply offers (marginal cost and available power) for time t
         mc_t = marginal_costs.loc[t]
         power_t = power.loc[t]
         start = t
         end = start + pd.Timedelta(config.market_products[0].duration)
-        # Compute the cumulative sum of available power in the sorted order.
-        # cumsum_power = sorted_power.cumsum()
-        supply_offers = (
-            pd.DataFrame(
-                {
-                    "start_time": start,
-                    "end_time": end,
-                    "only_hours": None,
-                    "node": "node0",
-                    "price": mc_t,
-                    "volume": power_t,
-                    "bid_type": "SB",
-                    # "bid_id": [f"{unit.id}_{t}" for unit in powerplants_units],
-                }
-            )
-            .reset_index()
-            .rename(columns={"index": "bid_id"})
+
+        supply_offers = pd.DataFrame(
+            {
+                "start_time": start,
+                "end_time": end,
+                "only_hours": None,
+                "node": "node0",
+                "price": mc_t,
+                "volume": power_t,
+                "bid_type": "SB",
+                "bid_id": [f"{unit.id}_{t}" for unit in powerplants_units],
+            }
         )
 
         # shape of sum_demand: (time_steps, 1)
         demand_t = sum_demand.loc[t][0]
 
         # get the demand bids
-        demand_bids = (
-            pd.DataFrame(
-                {
-                    "start_time": start,
-                    "end_time": end,
-                    "only_hours": None,
-                    "node": "node0",
-                    "price": elastic_demand_prices,
-                    "volume": elastic_demand_volumes,
-                    "bid_type": "SB",
-                    # "bid_id": [f"elastic_demand_{t}_{i}" for i in range(len(elastic_demand_prices))],
-                }
-            )
-            .reset_index()
-            .rename(columns={"index": "bid_id"})
+        demand_bids = pd.DataFrame(
+            {
+                "start_time": start,
+                "end_time": end,
+                "only_hours": None,
+                "node": "node0",
+                "price": elastic_demand_prices,
+                "volume": elastic_demand_volumes,
+                "bid_type": "SB",
+                "bid_id": [
+                    f"elastic_demand_{t}_{i}" for i in range(len(elastic_demand_prices))
+                ],
+            }
         )
+
         # create an orderbook containing all supply offers and demand bids
         orderbook = []
         orderbook.extend(supply_offers.to_dict("records"))
         orderbook.extend(demand_bids.to_dict("records"))
-        inelastic_price_bid = max([unit.price[t] for unit in inelastic_demand_units])
-        if demand_t > 0:
+        if demand_t > 0 and len(inelastic_demand_units) > 0:
+            inelastic_price_bid = max(
+                [unit.price[t] for unit in inelastic_demand_units]
+            )
             orderbook.append(
                 {
                     "start_time": start,
@@ -319,6 +343,15 @@ def calculate_naive_price_elastic(
                     "bid_id": f"{inelastic_demand_units[0].id}_{t}",
                 }
             )
+
+        cleaned_orderbook = []
+        for bid in orderbook:
+            if isinstance(bid["volume"], dict):
+                if all(volume == 0 for volume in bid["volume"].values()):
+                    continue
+            elif bid["volume"] == 0:
+                continue
+            cleaned_orderbook.append(bid)
 
         mps = get_available_products(
             config.market_products, pd.Timestamp(start) - pd.Timedelta("1h")
@@ -336,7 +369,7 @@ def calculate_naive_price_elastic(
                 f"Invalid market mechanism {config.param_dict.get('market_mechanism')}."
             )
 
-        accepted, rejected, meta, flows = mechanism.clear(orderbook, mps)
+        _, _, meta, _ = mechanism.clear(cleaned_orderbook, mps)
         price_forecast.loc[t] = meta[0]["price"]
 
     return price_forecast
@@ -354,11 +387,7 @@ def calculate_naive_price(
     _, demand_units, _, _, _ = sort_units(units, config.market_id)
 
     elastic_demand_units = {
-        unit.id: unit
-        for unit in demand_units
-        if isinstance(
-            unit.bidding_strategies[config.market_id], EnergyHeuristicElasticStrategy
-        )
+        unit.id: unit for unit in demand_units if is_elastic_demand(unit, config)
     }
 
     if len(elastic_demand_units) > 0:
@@ -376,7 +405,11 @@ def calculate_naive_residual_load(
     config: MarketConfig,
     preprocess_information=None,
 ) -> dict[str, ForecastSeries]:
-    """Compute residual load as total demand minus renewable generation for each timestep."""
+    """Compute residual load as total demand minus renewable generation for each timestep.
+
+    NOTE: Elastic demands are ignored in this forecast.
+          This will underestimate the residual load if there are elastic demands present.
+    """
     powerplants_units, demand_units, exchange_units, _, _ = sort_units(
         units, config.market_id
     )
@@ -426,6 +459,9 @@ def calculate_naive_congestion_signal(
 ) -> dict[str, ForecastSeries]:
     """
     Compute per-node congestion severity signals from net load and line capacities.
+    Node congestion forecast resembles:
+        max(line congestion of connected lines)
+            with line congestion = (demand - supply) / line capacity
 
     Steps:
         1. **Net load per node** — for each demand node, subtract local generation from
@@ -436,6 +472,7 @@ def calculate_naive_congestion_signal(
             across all connected lines as the node's congestion signal.
 
     Returns an empty dict if grid data (buses/lines) is unavailable.
+    NOTE: Elastic demands are ignored currently.
     """
     if isinstance(index, FastIndex):
         index = index.as_datetimeindex()
@@ -454,6 +491,10 @@ def calculate_naive_congestion_signal(
             "Node-specific congestion signals forecast could not be calculated. "
             "Not all unit nodes are available in buses."
         )
+        return {}
+
+    # Go on if only elastic demand (as they are ignored)
+    if all([is_elastic_demand(unit) for unit in demand_units]):
         return {}
 
     # Step 1: Calculate load for each powerplant based on availability factor and max power
