@@ -477,6 +477,10 @@ def save_unique_forecasts(units, save_path: Path) -> None:
         "congestion_signal": "congestion_signal_naive_forecast",
         "renewable_utilisation": "renewable_utilisation_naive_forecast",
     }
+    # Track which unit provides per-line congestion signals (deduplicated by algorithm)
+    unique_line_congestion_units: dict[str, object] = {}
+    default_line_congestion_alg = "congestion_signal_line_naive_forecast"
+
     for unit in units:
         algs = unit.forecaster.forecast_algorithms
         if isinstance(unit.forecaster, DsmUnitForecaster):
@@ -487,6 +491,13 @@ def save_unique_forecasts(units, save_path: Path) -> None:
             for key in ["price", "residual_load"]:
                 forecast_name = algs.get(key, default_values[key])
                 unique_forecasts[key][forecast_name] = unit
+
+        # All unit types: track per-line congestion signals when available
+        if unit.forecaster.congestion_signal_lines:
+            forecast_name = algs.get(
+                "congestion_signal_lines", default_line_congestion_alg
+            )
+            unique_line_congestion_units[forecast_name] = unit
 
     forecast_dict = {}
     for f_type in unique_forecasts:  # price, residual_load, ...
@@ -505,6 +516,12 @@ def save_unique_forecasts(units, save_path: Path) -> None:
                     )
             else:
                 forecast_dict[f"{f_name}"] = forecast.as_pd_series(name=f"{f_name}")
+
+    # Export per-line congestion signals as {line_id}_congestion_signal columns
+    for _f_name, unit in unique_line_congestion_units.items():
+        for line_id, series in unit.forecaster.congestion_signal_lines.items():
+            col_name = f"{line_id}_congestion_signal"
+            forecast_dict[col_name] = series.as_pd_series(name=col_name)
 
     if not forecast_dict:
         logger.info("No unique forecasts to save.")

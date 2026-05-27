@@ -152,3 +152,5 @@ examples/notebooks/outputs
 *.nbconvert.ipynb
 fameSetup.yaml
 .claude
+.isaac_docs
+.isaac_docs/*

@@ -167,6 +167,8 @@ class UnitForecaster:
         forecast_algorithms (dict[str, str]): Map of ``{prefix}_{metric}`` keys to algorithm IDs.
         price (dict[str, ForecastSeries]): Map of ``market_id`` to forecasted prices (initialized from ``market_prices``).
         residual_load (dict[str, ForecastSeries]): Map of ``market_id`` to forecasted residual load.
+        congestion_signal_lines (dict[str, FastSeries]): Map of ``line_id`` to per-line congestion signal.
+            Populated by ``congestion_signal_line_naive_forecast`` (or kept empty when grid data is absent).
         preprocess_information (dict): Intermediate data prepared during the ``preprocess`` step,
             keyed by metric name (e.g. ``"price"``, ``"residual_load"``).
     """
@@ -200,6 +202,7 @@ class UnitForecaster:
             residual_load
         )
         self.preprocess_information = {}
+        self.congestion_signal_lines: dict[str, FastSeries] = {}
 
     def _to_series(self, item: ForecastSeries) -> FastSeries:
         """Wrap *item* in a ``FastSeries`` aligned to ``self.index`` (no-op if already one)."""
@@ -255,6 +258,20 @@ class UnitForecaster:
         )
         self.preprocess_information["residual_load"] = (
             residual_load_preprocess_algorithm(
+                self.index, units, market_configs, forecast_df, initializing_unit
+            )
+        )
+
+        congestion_signal_lines_preprocess_algorithm_name = (
+            self.forecast_algorithms.get(
+                "preprocess_congestion_signal_lines", "congestion_signal_lines_default"
+            )
+        )
+        congestion_signal_lines_preprocess_algorithm = self._registries[
+            "preprocess"
+        ].get(congestion_signal_lines_preprocess_algorithm_name)
+        self.preprocess_information["congestion_signal_lines"] = (
+            congestion_signal_lines_preprocess_algorithm(
                 self.index, units, market_configs, forecast_df, initializing_unit
             )
         )
@@ -324,6 +341,26 @@ class UnitForecaster:
             )
             self.residual_load = self._dict_to_series(self.residual_load)
 
+        # 3. Get per-line congestion signal forecast
+        congestion_signal_lines_alg_name = self.forecast_algorithms.get(
+            "congestion_signal_lines", "congestion_signal_line_naive_forecast"
+        )
+        congestion_signal_lines_alg = self._registries["init"].get(
+            congestion_signal_lines_alg_name
+        )
+        if congestion_signal_lines_alg is not None:  # None means keep existing
+            result = congestion_signal_lines_alg(
+                self.index,
+                units,
+                market_configs,
+                self.preprocess_information.get("congestion_signal_lines"),
+            )
+            if result:
+                self.congestion_signal_lines = {
+                    line_id: self._to_series(series)
+                    for line_id, series in result.items()
+                }
+
     def update(self, *args, **kwargs):
         """Revise forecast timeseries during runtime (e.g. during bid calculation).
 
@@ -362,6 +399,19 @@ class UnitForecaster:
             **kwargs,
         )
         self.residual_load = self._dict_to_series(self.residual_load)
+
+        congestion_signal_lines_update_algorithm_name = self.forecast_algorithms.get(
+            "update_congestion_signal_lines", "congestion_signal_lines_default"
+        )
+        congestion_signal_lines_update_algorithm = self._registries["update"].get(
+            congestion_signal_lines_update_algorithm_name
+        )
+        self.congestion_signal_lines = congestion_signal_lines_update_algorithm(
+            self.congestion_signal_lines,
+            self.preprocess_information.get("congestion_signal_lines"),
+            *args,
+            **kwargs,
+        )
 
 
 class CustomUnitForecaster(UnitForecaster):

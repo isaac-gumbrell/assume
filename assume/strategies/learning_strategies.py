@@ -1331,3 +1331,148 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
             self.learning_role.add_reward_to_cache(
                 unit.id, start, reward, regret, profit
             )
+
+
+class _CongestionObsMixin:
+    """Mixin that injects per-line congestion windows into the observation vector.
+
+    Observation vector layout (unchanged from base, with congestion inserted):
+        ``[res_load_forecast | price_forecast | price_history | congestion_windows | individual_obs]``
+
+    The ``individual_obs`` tail stays at the end so the centralised critic in
+    ``matd3.py`` can correctly split shared vs. unique observations.
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Forward window length for congestion signals. Default 1.
+    """
+
+    def __init__(self, *args, n_lines: int, congestion_foresight: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_lines = n_lines
+        self.congestion_foresight = congestion_foresight
+        # Override obs_dim to include the congestion channels
+        self.obs_dim = (
+            self.num_timeseries_obs_dim * self.foresight
+            + n_lines * congestion_foresight
+            + self.unique_obs_dim
+        )
+
+    def prepare_observations(self, unit, market_id):
+        super().prepare_observations(unit, market_id)
+        line_signals = unit.forecaster.congestion_signal_lines
+        # Fixed sorted order so channel N always maps to the same line
+        self.congestion_line_obs: dict[str, FastSeries] = {
+            line_id: line_signals[line_id] for line_id in sorted(line_signals.keys())
+        }
+
+    def create_observation(
+        self, unit: BaseUnit, market_id: str, start: datetime, end: datetime
+    ):
+        """Build observation with congestion windows inserted before individual_obs."""
+        if not hasattr(self, "scaled_res_load_obs") or not hasattr(
+            self, "scaled_prices_obs"
+        ):
+            self.prepare_observations(unit, market_id)
+        if not hasattr(self, "congestion_line_obs"):
+            self.prepare_observations(unit, market_id)
+
+        # Timeseries components (same as base create_observation)
+        scaled_res_load_forecast = self.scaled_res_load_obs.window(
+            start, self.foresight, direction="forward"
+        )
+        scaled_price_forecast = self.scaled_prices_obs.window(
+            start, self.foresight, direction="forward"
+        )
+        scaled_price_history = (
+            unit.outputs["energy_accepted_price"].window(
+                start, self.foresight, direction="backward"
+            )
+            / self.max_bid_price
+        )
+
+        # Congestion windows: n_lines * congestion_foresight values
+        if self.congestion_line_obs:
+            congestion_windows = np.concatenate(
+                [
+                    self.congestion_line_obs[line_id].window(
+                        start, self.congestion_foresight, direction="forward"
+                    )
+                    for line_id in sorted(self.congestion_line_obs.keys())
+                ]
+            )
+        else:
+            congestion_windows = np.zeros(self.n_lines * self.congestion_foresight)
+
+        individual_observations = self.get_individual_observations(unit, start, end)
+
+        observation = np.concatenate(
+            [
+                scaled_res_load_forecast,
+                scaled_price_forecast,
+                scaled_price_history,
+                congestion_windows,
+                individual_observations,
+            ]
+        )
+
+        observation = th.as_tensor(
+            observation, dtype=self.float_type, device=self.device
+        ).flatten()
+
+        if self.learning_mode:
+            self.learning_role.add_observation_to_cache(
+                self.unit_id, start, observation
+            )
+
+        return observation
+
+
+class EnergyLearningStrategyCongestion(_CongestionObsMixin, EnergyLearningStrategy):
+    """EnergyLearningStrategy extended with per-line congestion observation channels.
+
+    Observation layout:
+        ``[res_load(foresight) | price(foresight) | price_history(foresight) |``
+        ``congestion(n_lines * congestion_foresight) | dispatch | marginal_cost]``
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Window length for congestion channels. Default 1.
+        **kwargs: Forwarded to :class:`EnergyLearningStrategy`.
+    """
+
+
+class EnergyLearningSingleBidStrategyCongestion(
+    _CongestionObsMixin, EnergyLearningSingleBidStrategy
+):
+    """EnergyLearningSingleBidStrategy extended with per-line congestion observation channels.
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Window length for congestion channels. Default 1.
+        **kwargs: Forwarded to :class:`EnergyLearningSingleBidStrategy`.
+    """
+
+
+class StorageEnergyLearningStrategyCongestion(
+    _CongestionObsMixin, StorageEnergyLearningStrategy
+):
+    """StorageEnergyLearningStrategy extended with per-line congestion observation channels.
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Window length for congestion channels. Default 1.
+        **kwargs: Forwarded to :class:`StorageEnergyLearningStrategy`.
+    """
+
+
+class RenewableEnergyLearningSingleBidStrategyCongestion(
+    _CongestionObsMixin, RenewableEnergyLearningSingleBidStrategy
+):
+    """RenewableEnergyLearningSingleBidStrategy extended with per-line congestion observation channels.
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Window length for congestion channels. Default 1.
+        **kwargs: Forwarded to :class:`RenewableEnergyLearningSingleBidStrategy`.
+    """

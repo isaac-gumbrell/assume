@@ -571,6 +571,117 @@ def calculate_naive_congestion_signal(
 
 
 @lru_cache
+def calculate_naive_line_congestion_signal(
+    index: ForecastIndex,
+    units: list[BaseUnit],
+    market_configs: list[MarketConfig],
+    preprocess_information=None,
+) -> dict[str, ForecastSeries]:
+    """
+    Compute per-line congestion severity signals from net load and line capacities.
+
+    This is Steps 1–3 of :func:`calculate_naive_congestion_signal` without the node-aggregation
+    Step 4. Returns one ``FastSeries`` per line (keyed by ``line_id``).
+
+    When the lines dataframe contains ``s_nom_forward`` and ``s_nom_reverse`` columns
+    (introduced by the directional-constraints branch), directional capacity is used:
+
+    - ``net_load > 0``  → forward direction (bus0 → bus1): capacity = ``s_nom_forward``
+    - ``net_load ≤ 0``  → reverse direction (bus1 → bus0): capacity = ``s_nom_reverse``
+
+    Falls back to ``s_nom * s_max_pu`` for lines that lack directional columns or have NaN values.
+
+    Returns an empty dict if grid data (buses/lines) is unavailable.
+    NOTE: Elastic demands are ignored currently.
+    """
+    # Preserve FastIndex before converting for DatetimeIndex-based DataFrame ops
+    if isinstance(index, FastIndex):
+        fast_idx = index
+        index = index.as_datetimeindex()
+    else:
+        fast_idx = FastIndex.from_pandas_index(index)
+
+    buses, lines = extract_buses_and_lines(market_configs)
+
+    if buses is None or lines is None:
+        return {}
+
+    powerplants_units, demand_units, _, _, _ = sort_units(units)
+
+    demand_unit_nodes = {demand.node for demand in demand_units}
+    if not all(node in buses.index for node in demand_unit_nodes):
+        log.warning(
+            "Per-line congestion signals forecast could not be calculated. "
+            "Not all unit nodes are available in buses."
+        )
+        return {}
+
+    if all([is_elastic_demand(unit) for unit in demand_units]):
+        return {}
+
+    # Step 1: Max generation per powerplant
+    power = calculate_max_power(
+        powerplants_units, index=[pp.id for pp in powerplants_units]
+    ).T
+
+    # Step 2: Net load per node (demand − generation)
+    net_load_by_node = {}
+    for node in demand_unit_nodes:
+        node_demand_units = [unit for unit in demand_units if unit.node == node]
+        node_demand = calculate_sum_demand(node_demand_units, [])
+        node_powerplants = [unit.id for unit in powerplants_units if unit.node == node]
+        node_generation = power[node_powerplants].sum(axis=1)
+        net_load_by_node[node] = node_demand - node_generation
+
+    has_directional = (
+        "s_nom_forward" in lines.columns and "s_nom_reverse" in lines.columns
+    )
+
+    # Step 3: Per-line congestion signal
+    result: dict[str, FastSeries] = {}
+    for line_id, line_data in lines.iterrows():
+        node1, node2 = line_data["bus0"], line_data["bus1"]
+
+        if node1 not in net_load_by_node or node2 not in net_load_by_node:
+            continue
+
+        line_net_load = net_load_by_node[node1] + net_load_by_node[node2]
+        net_load_vals = line_net_load.values
+
+        if has_directional:
+            cap_f = lines.at[line_id, "s_nom_forward"]
+            cap_r = lines.at[line_id, "s_nom_reverse"]
+            if not pd.isna(cap_f) and not pd.isna(cap_r) and cap_f != 0 and cap_r != 0:
+                signal = np.where(
+                    net_load_vals > 0,
+                    net_load_vals / cap_f,
+                    net_load_vals / cap_r,
+                )
+            else:
+                s_max_pu = (
+                    lines.at[line_id, "s_max_pu"]
+                    if "s_max_pu" in lines.columns
+                    and not pd.isna(lines.at[line_id, "s_max_pu"])
+                    else 1.0
+                )
+                capacity = line_data["s_nom"] * s_max_pu
+                signal = net_load_vals / capacity
+        else:
+            s_max_pu = (
+                lines.at[line_id, "s_max_pu"]
+                if "s_max_pu" in lines.columns
+                and not pd.isna(lines.at[line_id, "s_max_pu"])
+                else 1.0
+            )
+            capacity = line_data["s_nom"] * s_max_pu
+            signal = net_load_vals / capacity
+
+        result[line_id] = FastSeries(index=fast_idx, value=signal)
+
+    return result
+
+
+@lru_cache
 def calculate_naive_renewable_utilisation(
     index: ForecastIndex,
     units: list[BaseUnit],
@@ -649,6 +760,8 @@ forecast_algorithms = {
         index=index, value=0.0
     ),
     "congestion_signal_keep_given": None,
+    "congestion_signal_line_naive_forecast": calculate_naive_line_congestion_signal,
+    "congestion_signal_lines_keep_given": None,
     "renewable_utilisation_naive_forecast": calculate_naive_renewable_utilisation,
     "renewable_utilisation_default_test": lambda index, *args: FastSeries(
         index=index, value=0.0
@@ -684,6 +797,7 @@ forecast_preprocess_algorithms = {
     "residual_load_prepare_multiple": prepare_unit_specific_residual_load_forecasts,
     "congestion_signal_default": default_preprocess,
     "renewable_utilisation_default": default_preprocess,
+    "congestion_signal_lines_default": default_preprocess,
 }
 
 
@@ -703,6 +817,7 @@ forecast_update_algorithms = {
     "residual_load_set_preloaded": set_preloaded_forecast_by_name,
     "congestion_signal_default": default_update,
     "renewable_utilisation_default": default_update,
+    "congestion_signal_lines_default": default_update,
 }
 
 
