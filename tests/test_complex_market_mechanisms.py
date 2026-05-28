@@ -535,6 +535,64 @@ def test_complex_clearing_LB():
     assert rejected_orders == []
 
 
+def test_complex_clearing_congestion_pct():
+    """When log_flows=True, complex clearing returns flows as a DataFrame with congestion_pct."""
+    market_config = simple_dayahead_auction_config
+    h = 2
+    market_config.market_products = [
+        MarketProduct(timedelta(hours=1), h, timedelta(hours=1))
+    ]
+    market_config.additional_fields = ["bid_type", "node_id"]
+
+    nodes = pd.DataFrame(
+        {"name": ["node1", "node2"], "v_nom": [380.0, 380.0]}
+    ).set_index("name")
+
+    lines = pd.DataFrame(
+        {
+            "name": ["line_1"],
+            "bus0": ["node1"],
+            "bus1": ["node2"],
+            "s_nom": [500.0],
+        }
+    ).set_index("name")
+
+    grid_data = {"buses": nodes, "lines": lines}
+    market_config.param_dict = {"grid_data": grid_data, "log_flows": True}
+
+    next_opening = market_config.opening_hours.after(datetime(2005, 6, 1))
+    products = get_available_products(market_config.market_products, next_opening)
+
+    orderbook = []
+    orderbook = extend_orderbook(
+        products, volume=-1000, price=3000, orderbook=orderbook, node="node1"
+    )
+    orderbook = extend_orderbook(
+        products, volume=-200, price=3000, orderbook=orderbook, node="node2"
+    )
+    orderbook = extend_orderbook(products, 1000, 100, orderbook, node="node1")
+    orderbook = extend_orderbook(products, 1000, 50, orderbook, node="node2")
+
+    mr = ComplexClearingRole(market_config)
+    _, _, _, flows = mr.clear(orderbook, products)
+
+    assert isinstance(flows, pd.DataFrame), (
+        "flows must be a DataFrame when log_flows=True"
+    )
+    assert "congestion_pct" in flows.columns
+    assert "flow" in flows.columns
+    assert "line" in flows.columns
+
+    # line_1 carries ~500 MW at s_nom=500 → congestion_pct ~ 1.0 (near capacity)
+    t0 = products[0][0]
+    row = flows[(flows["line"] == "line_1") & (flows.index == t0)]
+    assert not row.empty
+    expected = row["flow"].iloc[0] / 500.0
+    assert math.isclose(row["congestion_pct"].iloc[0], expected, abs_tol=eps)
+
+    market_config.param_dict = {}
+
+
 if __name__ == "__main__":
     pass
     # from assume.common.utils import plot_orderbook

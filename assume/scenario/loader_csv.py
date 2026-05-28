@@ -457,6 +457,91 @@ def read_units(
     return units_dict
 
 
+def load_srmc_congestion_from_db(
+    db_uri: str, simulation_id: str, index: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """
+    Load a frozen SRMC congestion forecast from the ``grid_flows`` database table.
+
+    Queries the ``grid_flows`` table for the given *simulation_id*, extracts the
+    ``congestion_pct`` column, pivots to wide format, and renames each column to
+    ``{line_id}_congestion_signal`` so it is consumed by the
+    ``congestion_signal_lines_load_from_df`` preprocess algorithm.
+
+    The result is reindexed to *index* using forward-fill to handle any gaps between
+    the SRMC run and the learning-run horizon.
+
+    Args:
+        db_uri:        SQLAlchemy-compatible DB URI (e.g. ``"sqlite:///local_db/my.db"``).
+        simulation_id: The ``simulation`` column value written by the SRMC run.
+        index:         The DatetimeIndex of the current scenario.
+
+    Returns:
+        DataFrame with columns ``{line_id}_congestion_signal`` indexed by datetime,
+        or an empty DataFrame (with the correct *index*) when the table/column is
+        missing or the simulation is not found.
+    """
+    from sqlalchemy import create_engine, inspect, text
+
+    engine = create_engine(db_uri)
+    try:
+        with engine.connect() as conn:
+            inspector = inspect(engine)
+            if "grid_flows" not in inspector.get_table_names():
+                logger.warning(
+                    "Table 'grid_flows' not found in DB '%s'. "
+                    "Returning empty SRMC congestion forecast.",
+                    db_uri,
+                )
+                return pd.DataFrame(index=index)
+
+            cols = [c["name"] for c in inspector.get_columns("grid_flows")]
+            if "congestion_pct" not in cols:
+                logger.warning(
+                    "'grid_flows' table in '%s' has no 'congestion_pct' column. "
+                    "Run an SRMC simulation with log_flows: true first.",
+                    db_uri,
+                )
+                return pd.DataFrame(index=index)
+
+            df = pd.read_sql(
+                text(
+                    "SELECT datetime, line, congestion_pct FROM grid_flows"
+                    " WHERE simulation = :sim"
+                ),
+                conn,
+                params={"sim": simulation_id},
+                parse_dates=["datetime"],
+            )
+    finally:
+        engine.dispose()
+
+    if df.empty:
+        logger.warning(
+            "No grid_flows rows found for simulation_id='%s'. "
+            "Returning empty SRMC congestion forecast.",
+            simulation_id,
+        )
+        return pd.DataFrame(index=index)
+
+    wide = df.pivot_table(
+        index="datetime", columns="line", values="congestion_pct", aggfunc="first"
+    )
+    wide.columns = [f"{col}_congestion_signal" for col in wide.columns]
+    wide.index = pd.to_datetime(wide.index)
+
+    # Reindex to scenario horizon; forward-fill gaps, then back-fill leading NaNs
+    wide = wide.reindex(index).ffill().bfill()
+
+    logger.info(
+        "Loaded SRMC congestion forecast for simulation '%s': %d lines, %d timesteps.",
+        simulation_id,
+        len(df["line"].unique()),
+        len(wide),
+    )
+    return wide
+
+
 def save_unique_forecasts(units, save_path: Path) -> None:
     """Collect unique forecasts computed by unit forecasters and write them to CSV.
 
@@ -619,6 +704,25 @@ def load_config_and_create_forecaster(
     forecasts_df = load_file(
         path=path, config=config, file_name="forecasts_df", index=index
     )
+
+    # If an SRMC pre-run simulation is specified, load its congestion_pct signals
+    # from the DB and merge them as {line_id}_congestion_signal columns into forecasts_df.
+    srmc_sim_id = config.get("srmc_congestion_simulation_id")
+    if srmc_sim_id:
+        db_uri = config.get("db_uri")
+        if not db_uri:
+            logger.warning(
+                "srmc_congestion_simulation_id is set but no db_uri found in config. "
+                "Skipping SRMC congestion forecast loading."
+            )
+        else:
+            srmc_df = load_srmc_congestion_from_db(db_uri, srmc_sim_id, index)
+            if not srmc_df.empty:
+                if forecasts_df is None:
+                    forecasts_df = srmc_df
+                else:
+                    forecasts_df = forecasts_df.join(srmc_df, how="outer")
+
     demand_df = load_file(path=path, config=config, file_name="demand_df", index=index)
     if demand_df is None:
         # no demand timeseries exist, all demand is elastic. Fill missing demand timeseries with zeros and raise a warning.

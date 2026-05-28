@@ -746,6 +746,84 @@ def calculate_naive_renewable_utilisation(
     return renewable_utilisation
 
 
+def congestion_signal_lines_load_from_df(
+    index: ForecastIndex,
+    units,
+    market_configs,
+    forecast_df=None,
+    initializing_unit=None,
+) -> dict[str, FastSeries]:
+    """
+    Preprocess algorithm: extract ``{line_id}_congestion_signal`` columns from *forecast_df*.
+
+    Used together with :func:`congestion_signal_lines_from_df` as the init algorithm to
+    load a frozen SRMC congestion forecast into the forecaster at scenario-setup time.
+
+    Column naming convention: columns whose names end in ``_congestion_signal`` are
+    treated as per-line signals; the part before ``_congestion_signal`` becomes the
+    ``line_id`` key in the returned dict.
+
+    Args:
+        index: Time index for the forecaster.
+        units: All units in the simulation (unused, present for API compatibility).
+        market_configs: Market configurations (unused, present for API compatibility).
+        forecast_df: DataFrame passed in during ``preprocess()``; may be ``None``.
+        initializing_unit: The unit being initialized (unused).
+
+    Returns:
+        ``dict[str, FastSeries]`` mapping ``line_id`` → congestion signal series, or
+        an empty dict if *forecast_df* is ``None`` or has no matching columns.
+    """
+    if forecast_df is None:
+        return {}
+
+    suffix = "_congestion_signal"
+    cols = {
+        col[: -len(suffix)]: col for col in forecast_df.columns if col.endswith(suffix)
+    }
+    if not cols:
+        return {}
+
+    fast_idx = (
+        index
+        if isinstance(index, FastIndex)
+        else FastIndex(start=index[0], end=index[-1], freq=pd.infer_freq(index))
+    )
+
+    result: dict[str, FastSeries] = {}
+    for line_id, col_name in cols.items():
+        series = forecast_df[col_name].reindex(fast_idx.as_datetimeindex())
+        result[line_id] = FastSeries(index=fast_idx, value=series.values)
+
+    return result
+
+
+def congestion_signal_lines_from_df(
+    index: ForecastIndex,
+    units,
+    market_configs,
+    preprocess_information=None,
+) -> dict[str, FastSeries]:
+    """
+    Init algorithm: return the ``dict[str, FastSeries]`` loaded by the paired
+    :func:`congestion_signal_lines_load_from_df` preprocess algorithm.
+
+    Configure a unit's forecaster with::
+
+        forecast_algorithms:
+          congestion_signal_lines: congestion_signal_lines_from_df
+          preprocess_congestion_signal_lines: congestion_signal_lines_load_from_df
+
+    and provide ``{line_id}_congestion_signal`` columns in *forecasts_df* (typically
+    loaded from the SRMC pass via ``srmc_congestion_simulation_id`` in the config).
+
+    Returns an empty dict when *preprocess_information* is ``None`` or empty, so that
+    the :class:`~assume.strategies.learning_strategies._CongestionObsMixin` zero-grid
+    fallback activates cleanly.
+    """
+    return preprocess_information or {}
+
+
 forecast_algorithms = {
     "price_naive_forecast": calculate_naive_price,
     "price_default_test": lambda index, *args: {
@@ -762,6 +840,7 @@ forecast_algorithms = {
     "congestion_signal_keep_given": None,
     "congestion_signal_line_naive_forecast": calculate_naive_line_congestion_signal,
     "congestion_signal_lines_keep_given": None,
+    "congestion_signal_lines_from_df": congestion_signal_lines_from_df,
     "renewable_utilisation_naive_forecast": calculate_naive_renewable_utilisation,
     "renewable_utilisation_default_test": lambda index, *args: FastSeries(
         index=index, value=0.0
@@ -798,6 +877,7 @@ forecast_preprocess_algorithms = {
     "congestion_signal_default": default_preprocess,
     "renewable_utilisation_default": default_preprocess,
     "congestion_signal_lines_default": default_preprocess,
+    "congestion_signal_lines_load_from_df": congestion_signal_lines_load_from_df,
 }
 
 

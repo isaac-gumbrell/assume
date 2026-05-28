@@ -11,6 +11,7 @@ import pyomo.environ as pyo
 from mango import AgentAddress
 from pyomo.opt import OptSolver, SolverFactory, TerminationCondition
 
+from assume.common.grid_utils import compute_flows_congestion_pct
 from assume.common.market_objects import MarketConfig, MarketProduct, Orderbook
 from assume.common.utils import (
     aggregate_line_capacities,
@@ -618,6 +619,7 @@ class ComplexClearingRole(MarketRole):
             market_clearing_prices=market_clearing_prices,
             pricing_mechanism=self.pricing_mechanism,
             log_flows=self.log_flows,
+            lines=self.lines,
         )
 
         self.all_orders = []
@@ -710,6 +712,7 @@ def extract_results(
     market_clearing_prices: dict,
     pricing_mechanism: str = "pay_as_clear",
     log_flows: bool = False,
+    lines: pd.DataFrame | None = None,
 ):
     """
     Extracts the results of the market clearing from the solved pyomo model.
@@ -720,9 +723,16 @@ def extract_results(
         rejected_orders (Orderbook): List of the rejected orders
         market_products (list[MarketProduct]): The products to be traded
         market_clearing_prices (dict): The market clearing prices
+        pricing_mechanism (str): The pricing mechanism to use
+        log_flows (bool): Whether to log network flows
+        lines (pd.DataFrame | None): Line capacity DataFrame used to compute
+            ``congestion_pct``.  When *None*, ``congestion_pct`` is set to 0.
 
     Returns:
-        tuple[Orderbook, Orderbook, list[dict]]: The accepted orders, rejected orders, and meta information
+        tuple[Orderbook, Orderbook, list[dict], dict | pd.DataFrame]:
+            The accepted orders, rejected orders, meta information, and network flows.
+            When *log_flows* is True the flows value is a DataFrame with columns
+            ``[line, flow, congestion_pct]`` indexed by datetime; otherwise ``{}``.
 
     """
     if pricing_mechanism not in ["pay_as_clear", "pay_as_bid"]:
@@ -827,14 +837,39 @@ def extract_results(
     flows_filtered = {}
 
     if log_flows:
-        # extract flows
-
         # Check if the model has the 'flows' attribute
         if hasattr(model, "flows"):
-            flows = model.flows
-
-            flows_filtered = {
-                index: flow.value for index, flow in flows.items() if not flow.stale
+            raw_flows = {
+                (t, line): flow.value
+                for (t, line), flow in model.flows.items()
+                if not flow.stale and flow.value is not None
             }
+
+            if raw_flows:
+                flow_long = pd.DataFrame(
+                    [
+                        {"datetime": t, "line": line, "flow": val}
+                        for (t, line), val in raw_flows.items()
+                    ]
+                )
+
+                if lines is not None:
+                    flow_wide = flow_long.pivot(
+                        index="datetime", columns="line", values="flow"
+                    )
+                    congestion_wide = compute_flows_congestion_pct(flow_wide, lines)
+                    congestion_long = (
+                        congestion_wide.stack(future_stack=True)
+                        .rename("congestion_pct")
+                        .reset_index()
+                    )
+                    congestion_long.columns = ["datetime", "line", "congestion_pct"]
+                    flow_long = flow_long.merge(
+                        congestion_long, on=["datetime", "line"], how="left"
+                    )
+                else:
+                    flow_long["congestion_pct"] = 0.0
+
+                flows_filtered = flow_long.set_index("datetime")
 
     return accepted_orders, rejected_orders, meta, flows_filtered

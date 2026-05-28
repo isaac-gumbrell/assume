@@ -11,7 +11,11 @@ import pandas as pd
 import pypsa
 from mango import AgentAddress
 
-from assume.common.grid_utils import get_supported_solver_linopy, read_pypsa_grid
+from assume.common.grid_utils import (
+    compute_flows_congestion_pct,
+    get_supported_solver_linopy,
+    read_pypsa_grid,
+)
 from assume.common.market_objects import MarketConfig, MarketProduct, Orderbook
 from assume.common.utils import create_incidence_matrix
 from assume.markets.base_market import MarketRole
@@ -357,6 +361,7 @@ class NodalClearingRole(MarketRole):
             market_products=market_products,
             market_clearing_prices=market_clearing_prices,
             log_flows=self.log_flows,
+            lines=self.lines,
         )
 
         return accepted_orders, rejected_orders, meta, flows
@@ -369,6 +374,7 @@ def extract_results(
     market_products: list[MarketProduct],
     market_clearing_prices: dict,
     log_flows: bool = False,
+    lines: pd.DataFrame | None = None,
 ):
     """
     Extracts the results of the market clearing from the solved PyPSA model.
@@ -380,9 +386,14 @@ def extract_results(
         market_products (list[MarketProduct]): The products to be traded
         market_clearing_prices (dict): The market clearing prices
         log_flows (bool): Whether to log network flows
+        lines (pd.DataFrame | None): Line capacity DataFrame used to compute
+            ``congestion_pct``.  When *None*, ``congestion_pct`` is set to 0.
 
     Returns:
-        tuple[Orderbook, Orderbook, list[dict], dict]: The accepted orders, rejected orders, meta information, and network flows
+        tuple[Orderbook, Orderbook, list[dict], dict | pd.DataFrame]:
+            The accepted orders, rejected orders, meta information, and network flows.
+            When *log_flows* is True the flows value is a DataFrame with columns
+            ``[line, flow, congestion_pct]`` indexed by datetime; otherwise ``{}``.
 
     """
     meta = []
@@ -428,7 +439,26 @@ def extract_results(
 
     flows = {}
     if log_flows:
-        # extract flows
-        flows = network.lines_t.p0.stack(future_stack=True).to_dict()
+        # Wide format: rows = snapshots, columns = line_ids, values = MW flow
+        flow_wide = network.lines_t.p0.copy()
+        flow_wide.index.name = "datetime"
+
+        # Compute congestion_pct = flow / capacity (directional if available)
+        lines_df = lines if lines is not None else network.lines
+        congestion_wide = compute_flows_congestion_pct(flow_wide, lines_df)
+
+        # Convert to long-format DataFrame: (datetime, line, flow, congestion_pct)
+        flow_long = flow_wide.stack(future_stack=True).rename("flow").reset_index()
+        flow_long.columns = ["datetime", "line", "flow"]
+        congestion_long = (
+            congestion_wide.stack(future_stack=True)
+            .rename("congestion_pct")
+            .reset_index()
+        )
+        congestion_long.columns = ["datetime", "line", "congestion_pct"]
+
+        flows = flow_long.merge(congestion_long, on=["datetime", "line"]).set_index(
+            "datetime"
+        )
 
     return accepted_orders, rejected_orders, meta, flows
