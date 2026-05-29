@@ -1348,15 +1348,19 @@ class _CongestionObsMixin:
     """
 
     def __init__(self, *args, n_lines: int, congestion_foresight: int = 1, **kwargs):
+        # Inflate unique_obs_dim before the parent chain so that LearningStrategy
+        # computes obs_dim = num_timeseries_obs_dim * foresight
+        #                   + (unique_obs_dim + n_lines * congestion_foresight)
+        # correctly.  We restore the real unique_obs_dim afterwards so the
+        # centralised critic still splits shared vs. individual observations correctly.
+        base_unique_obs_dim = kwargs.get("unique_obs_dim", 2)
+        kwargs["unique_obs_dim"] = base_unique_obs_dim + n_lines * congestion_foresight
         super().__init__(*args, **kwargs)
+        # Restore true unique_obs_dim (tail length for critic splitting).
+        self.unique_obs_dim = base_unique_obs_dim
         self.n_lines = n_lines
         self.congestion_foresight = congestion_foresight
-        # Override obs_dim to include the congestion channels
-        self.obs_dim = (
-            self.num_timeseries_obs_dim * self.foresight
-            + n_lines * congestion_foresight
-            + self.unique_obs_dim
-        )
+        # obs_dim is already correct from LearningStrategy.__init__
 
     def prepare_observations(self, unit, market_id):
         super().prepare_observations(unit, market_id)
