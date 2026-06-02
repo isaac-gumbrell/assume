@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: ASSUME Developers
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Minimal paired-scenario (BAU side) for D3 staggered training smoke testing.
+# Pairs with sibling scenario `staggered_inv`; the `staggered_training` block
+# below activates `run_staggered_learning`.
+
+staggered:
+  start_date: 2019-03-01 00:00
+  end_date: 2019-03-03 00:00
+  time_step: 1h
+  save_frequency_hours: 24
+  seed: 42
+
+  learning_config:
+    learning_mode: true
+    continue_learning: false
+    trained_policies_save_path: null
+    trained_policies_load_path: null
+    max_bid_price: 100
+    algorithm: matd3
+    learning_rate: 0.001
+    training_episodes: 6
+    episodes_collecting_initial_experience: 1
+    train_freq: 24h
+    gradient_steps: 5
+    batch_size: 32
+    gamma: 0.99
+    device: cpu
+    noise_sigma: 0.1
+    noise_scale: 1
+    noise_dt: 1
+    validation_episodes_interval: 3
+
+    staggered_training:
+      enabled: true
+      swap_order_per_episode: true
+      scenarios:
+        - path: "."
+          name: "bau"
+        - path: "../staggered_inv"
+          name: "inv"
+
+  markets_config:
+    EOM:
+      operator: EOM_operator
+      product_type: energy
+      start_date: 2019-03-01 00:00
+      products:
+        - duration: 1h
+          count: 1
+          first_delivery: 1h
+      opening_frequency: 1h
+      opening_duration: 1h
+      volume_unit: MWh
+      maximum_bid_volume: 100000
+      maximum_bid_price: 3000
+      minimum_bid_price: -500
+      price_unit: EUR/MWh
+      market_mechanism: pay_as_clear

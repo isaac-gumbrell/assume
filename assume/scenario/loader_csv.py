@@ -264,6 +264,13 @@ def replace_paths(config: dict, inputs_path: str):
             if isinstance(value, dict | list):
                 config[key] = replace_paths(value, inputs_path)
             elif isinstance(key, str) and key.endswith("_path") and value is not None:
+                # Skip values that are already absolute filesystem paths — this
+                # is critical for paired-scenario staggered training, where the
+                # shared trained-policies path is set programmatically (and
+                # absolute) on a per-world scenario_data after each world's
+                # primary inputs_path has already been resolved.
+                if os.path.isabs(value):
+                    continue
                 if not value.startswith(inputs_path):
                     config[key] = inputs_path + "/" + value
     elif isinstance(config, list):
@@ -624,6 +631,7 @@ def load_config_and_create_forecaster(
     inputs_path: str,
     scenario: str,
     study_case: str,
+    extra_units: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, object]:
     """
     Load the configuration and files for a given scenario and study case. This function
@@ -633,6 +641,15 @@ def load_config_and_create_forecaster(
         inputs_path (str): The path to the folder containing input files necessary for the scenario.
         scenario (str): The name of the scenario to be loaded.
         study_case (str): The specific study case within the scenario to be loaded.
+        extra_units (dict[str, pd.DataFrame] | None): Optional foreign-unit DataFrames
+            to merge into this scenario for staggered (paired) training. Keys are
+            ``"powerplant_units"``, ``"storage_units"``, and ``"demand_units"``;
+            values are DataFrames whose rows describe units that natively belong
+            to the *other* paired scenario. Foreign units are appended to the local
+            unit DataFrames and forced to ``availability = 0`` over the entire
+            simulation horizon (with demand also forced to ``0``), so the local
+            scenario's grid and clearing remain unchanged. See the D3 staggered
+            training spec for details.
 
     Returns:
         dict[str, object]:: A dictionary containing the configuration and loaded files for the scenario and study case.
@@ -669,6 +686,39 @@ def load_config_and_create_forecaster(
     storage_units = load_file(path=path, config=config, file_name="storage_units")
     demand_units = load_file(path=path, config=config, file_name="demand_units")
     exchange_units = load_file(path=path, config=config, file_name="exchange_units")
+
+    # Merge foreign-unit rows for staggered training before any downstream processing.
+    # Tracks foreign ids so we can later force availability=0 / demand=0.
+    foreign_unit_ids: dict[str, list[str]] = {
+        "powerplant_units": [],
+        "storage_units": [],
+        "demand_units": [],
+    }
+    if extra_units:
+        for ut_name in ("powerplant_units", "storage_units", "demand_units"):
+            extra_df = extra_units.get(ut_name)
+            if extra_df is None or extra_df.empty:
+                continue
+            local_df = {
+                "powerplant_units": powerplant_units,
+                "storage_units": storage_units,
+                "demand_units": demand_units,
+            }[ut_name]
+            if local_df is None:
+                merged = extra_df.copy()
+            else:
+                # only append rows whose ids aren't already present locally
+                new_ids = [uid for uid in extra_df.index if uid not in local_df.index]
+                if not new_ids:
+                    continue
+                merged = pd.concat([local_df, extra_df.loc[new_ids]])
+                foreign_unit_ids[ut_name].extend(new_ids)
+            if ut_name == "powerplant_units":
+                powerplant_units = merged
+            elif ut_name == "storage_units":
+                storage_units = merged
+            else:
+                demand_units = merged
 
     if powerplant_units is None or demand_units is None:
         raise ValueError("No power plant or no demand units were provided!")
@@ -758,6 +808,19 @@ def load_config_and_create_forecaster(
 
     if availability is None:
         availability = pd.DataFrame(index=index)
+
+    # Force foreign-scenario units to availability=0 and (for demand) demand=0
+    # so they remain registered/dispatchable but contribute nothing to clearing.
+    if extra_units:
+        all_foreign_ids = (
+            foreign_unit_ids["powerplant_units"]
+            + foreign_unit_ids["storage_units"]
+            + foreign_unit_ids["demand_units"]
+        )
+        for uid in all_foreign_ids:
+            availability[uid] = 0.0
+        for uid in foreign_unit_ids["demand_units"]:
+            demand_df[uid] = 0.0
 
     fuel_prices_df = load_file(
         path=path, config=config, file_name="fuel_prices_df", index=index
@@ -1194,6 +1257,290 @@ def load_scenario_folder(
     setup_world(world=world)
 
 
+def _read_unit_index(path: str, file_name: str) -> set[str]:
+    """Read a unit CSV from a scenario path and return the set of unit ids.
+
+    Returns an empty set if the file does not exist (e.g. a scenario without
+    storage units).
+    """
+    fp = Path(path) / f"{file_name}.csv"
+    if not fp.exists():
+        return set()
+    df = pd.read_csv(fp, index_col=0)
+    return set(df.index.astype(str))
+
+
+def _read_unit_csv(path: str, file_name: str) -> pd.DataFrame | None:
+    """Read a unit CSV (raw, no config redirect) and return the DataFrame or None."""
+    fp = Path(path) / f"{file_name}.csv"
+    if not fp.exists():
+        return None
+    df = pd.read_csv(
+        fp,
+        index_col=0,
+        encoding="utf-8",
+        na_values=["n.a.", "None", "-", "none", "nan"],
+    )
+    df.index = df.index.astype(str)
+    return df
+
+
+def build_staggered_supersets(
+    scenario_paths: list[str],
+) -> tuple[
+    list[set[str]],
+    dict[str, dict[str, pd.DataFrame]],
+]:
+    """
+    Build the cross-scenario unit supersets used by D3 staggered training.
+
+    Reads ``powerplant_units.csv``, ``storage_units.csv`` and ``demand_units.csv``
+    from each scenario folder, computes the union of unit ids per type, and for
+    each scenario derives the set of *foreign* rows that must be merged in so the
+    union of registered RL agents is identical across both worlds.
+
+    Args:
+        scenario_paths: Filesystem paths to the scenario folders (each containing
+            ``config.yaml`` and the unit CSVs).
+
+    Returns:
+        Tuple ``(local_ids_per_scenario, extra_units_per_scenario)``:
+            - ``local_ids_per_scenario[i]`` — the set of unit ids that
+              natively belong to scenario *i* (across all unit types).
+            - ``extra_units_per_scenario[scenario_path]`` — dict with keys
+              ``"powerplant_units"``, ``"storage_units"``, ``"demand_units"``
+              and DataFrame values containing the rows from the *other*
+              scenarios that must be merged in (with availability=0). Only
+              unit ids missing from this scenario are returned.
+    """
+    UNIT_TYPES = ("powerplant_units", "storage_units", "demand_units")
+
+    # canonical row per unit id per type, taken from the scenario where it natively lives
+    canonical: dict[str, dict[str, pd.Series]] = {ut: {} for ut in UNIT_TYPES}
+    local_ids: list[set[str]] = []
+    for sp in scenario_paths:
+        ids_here: set[str] = set()
+        for ut in UNIT_TYPES:
+            df = _read_unit_csv(sp, ut)
+            if df is None:
+                continue
+            for uid, row in df.iterrows():
+                ids_here.add(str(uid))
+                canonical[ut].setdefault(str(uid), row)
+        local_ids.append(ids_here)
+
+    extra_units_per_scenario: dict[str, dict[str, pd.DataFrame]] = {}
+    for i, sp in enumerate(scenario_paths):
+        local_dfs = {ut: _read_unit_csv(sp, ut) for ut in UNIT_TYPES}
+        extras: dict[str, pd.DataFrame] = {}
+        for ut in UNIT_TYPES:
+            local_set = (
+                set(local_dfs[ut].index.astype(str))
+                if local_dfs[ut] is not None
+                else set()
+            )
+            foreign_ids = [uid for uid in canonical[ut] if uid not in local_set]
+            if not foreign_ids:
+                extras[ut] = pd.DataFrame()
+                continue
+            extras[ut] = pd.DataFrame(
+                [canonical[ut][uid] for uid in foreign_ids],
+                index=foreign_ids,
+            )
+        extra_units_per_scenario[sp] = extras
+
+        # Optionally write _superset/ CSVs alongside the scenario for inspection.
+        try:
+            superset_dir = Path(sp) / "_superset"
+            superset_dir.mkdir(exist_ok=True)
+            for ut in UNIT_TYPES:
+                local_df = local_dfs[ut]
+                merged = (
+                    pd.concat([local_df, extras[ut]])
+                    if (local_df is not None and not extras[ut].empty)
+                    else (
+                        local_df
+                        if local_df is not None
+                        else (extras[ut] if not extras[ut].empty else None)
+                    )
+                )
+                if merged is not None:
+                    merged.to_csv(superset_dir / f"{ut}.csv")
+        except OSError as e:  # pragma: no cover — non-fatal, inspection-only
+            logger.warning(f"Could not write _superset CSVs to {sp}: {e}")
+
+    return local_ids, extra_units_per_scenario
+
+
+def load_staggered_scenario(
+    worlds: list[World],
+    inputs_path: str,
+    scenario: str,
+    study_case: str,
+) -> None:
+    """
+    Load a paired (D3 staggered training) scenario into two ``World`` instances.
+
+    The primary scenario referenced by ``inputs_path/scenario`` must contain a
+    ``learning_config.staggered_training`` block listing exactly two scenarios
+    (the primary plus one paired scenario). Both scenarios are loaded with the
+    cross-scenario unit superset merged in, so each world registers the union
+    of RL agents and foreign units sit at availability=0 (G2 / G4 of the spec).
+
+    Each world's ``simulation_id`` is set to its scenario folder name so DB
+    outputs are namespaced cleanly (e.g. ``staggered_bau`` vs
+    ``staggered_inv``). The configured logical alias is preserved on
+    ``world.scenario_data["staggered_scenario_name"]`` for metric reporting.
+
+    Args:
+        worlds: Exactly two ``World`` instances; populated in place.
+        inputs_path: Inputs root (same as ``load_scenario_folder``).
+        scenario: Primary scenario folder name.
+        study_case: Study case key inside the primary ``config.yaml``.
+    """
+    if len(worlds) != 2:
+        raise ValueError(
+            f"load_staggered_scenario requires exactly 2 World instances, got {len(worlds)}"
+        )
+
+    # Read the primary config to discover the paired scenarios.
+    primary_path = f"{inputs_path}/{scenario}"
+    with open(f"{primary_path}/config.yaml") as f:
+        primary_config = yaml.safe_load(f)
+    if not study_case:
+        study_case = list(primary_config.keys())[0]
+    primary_config = primary_config[study_case]
+    learning_config = primary_config.get("learning_config", {}) or {}
+    staggered = learning_config.get("staggered_training", {}) or {}
+    if not staggered.get("enabled"):
+        raise ValueError(
+            "load_staggered_scenario called but 'learning_config.staggered_training.enabled' is not true."
+        )
+    scenarios = staggered.get("scenarios", [])
+    if len(scenarios) != 2:
+        raise ValueError(
+            f"learning_config.staggered_training.scenarios must list exactly 2 scenarios, got {len(scenarios)}"
+        )
+    names = [s.get("name") for s in scenarios]
+    if any(not n for n in names) or len(set(names)) != 2:
+        raise ValueError(
+            f"staggered_training.scenarios must have unique non-empty names; got {names}"
+        )
+    for n in names:
+        if not str(n).replace("_", "").isalnum():
+            raise ValueError(
+                f"staggered_training scenario name '{n}' must be alphanumeric/underscore (DB-safe)."
+            )
+
+    # Resolve scenario paths. Each entry's `path` is interpreted relative to the
+    # primary scenario folder so config files can stay portable.
+    scenario_paths: list[str] = []
+    for s in scenarios:
+        p = Path(s["path"])
+        if not p.is_absolute():
+            p = (Path(primary_path) / p).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Staggered scenario path does not exist: {p}")
+        scenario_paths.append(str(p))
+
+    # Build the unit supersets across both scenarios.
+    _local_ids, extras_by_path = build_staggered_supersets(scenario_paths)
+
+    # Load each scenario into its world with the foreign rows merged in.
+    # Both worlds must share the same asyncio event loop so the orchestrator
+    # can advance them in lockstep inside a single ``run_until_complete``.
+    for w in worlds[1:]:
+        w.loop = worlds[0].loop
+    base_sim_id: str | None = None
+    rl_unit_id_sets: list[set[str]] = []
+    line_id_sets: list[set[str]] = []
+    for world, sp, name in zip(worlds, scenario_paths, names):
+        sp_path = Path(sp)
+        scenario_inputs_path = str(sp_path.parent)
+        scenario_name = sp_path.name
+        # discover study_case for this scenario (fall back to primary study_case)
+        with open(sp_path / "config.yaml") as f:
+            sc_config = yaml.safe_load(f)
+        sc_study_case = (
+            study_case if study_case in sc_config else list(sc_config.keys())[0]
+        )
+
+        world.scenario_data = load_config_and_create_forecaster(
+            scenario_inputs_path,
+            scenario_name,
+            sc_study_case,
+            extra_units=extras_by_path[sp],
+        )
+
+        # Namespace simulation_id by the scenario folder name so DB outputs
+        # are separable and there is no study-case / scenario-name stutter
+        # (e.g. ``staggered_bau`` and ``staggered_inv`` rather than
+        # ``staggered_bau_staggered_bau`` / ``staggered_bau_staggered_inv``).
+        # The logical scenario alias is preserved separately under
+        # ``staggered_scenario_name`` for metric reporting.
+        if base_sim_id is None:
+            base_sim_id = world.scenario_data["simulation_id"]
+        world.scenario_data["simulation_id"] = scenario_name
+        world.scenario_data["staggered_scenario_name"] = name
+
+        # Setup the world
+        setup_world(world=world)
+
+        # Track RL unit ids and grid line ids for cross-world consistency checks.
+        rl_unit_id_sets.append(
+            set(getattr(world, "learning_role", None).rl_strats.keys())
+            if world.learning_role is not None
+            else set()
+        )
+        line_id_sets.append(_collect_market_line_ids(world))
+
+    # G2 — registered RL units must match across both worlds.
+    if rl_unit_id_sets[0] != rl_unit_id_sets[1]:
+        only_a = rl_unit_id_sets[0] - rl_unit_id_sets[1]
+        only_b = rl_unit_id_sets[1] - rl_unit_id_sets[0]
+        raise ValueError(
+            "Staggered training G2 violation: RL agent ids differ between worlds. "
+            f"Only in scenario '{names[0]}': {sorted(only_a)}; "
+            f"only in scenario '{names[1]}': {sorted(only_b)}."
+        )
+
+    # 5.1 — line ids must be identical (only line capacities may differ).
+    if line_id_sets[0] and line_id_sets[1] and line_id_sets[0] != line_id_sets[1]:
+        only_a = line_id_sets[0] - line_id_sets[1]
+        only_b = line_id_sets[1] - line_id_sets[0]
+        raise ValueError(
+            "Staggered training requires identical line ids across both scenarios "
+            "(only capacities may differ). "
+            f"Only in scenario '{names[0]}': {sorted(only_a)}; "
+            f"only in scenario '{names[1]}': {sorted(only_b)}."
+        )
+
+
+def _collect_market_line_ids(world: World) -> set[str]:
+    """Return the union of line ids across all networked markets registered in *world*.
+
+    Returns an empty set when no market carries a ``grid_data`` payload (e.g.
+    scenarios without network constraints).
+    """
+    line_ids: set[str] = set()
+    for market_config in world.markets.values():
+        grid_data = (
+            market_config.param_dict.get("grid_data")
+            if hasattr(market_config, "param_dict")
+            else None
+        )
+        if not grid_data:
+            continue
+        lines_df = grid_data.get("lines") if isinstance(grid_data, dict) else None
+        if lines_df is None:
+            continue
+        try:
+            line_ids.update(str(i) for i in lines_df.index)
+        except Exception:  # pragma: no cover — defensive
+            continue
+    return line_ids
+
+
 def load_custom_units(
     world: World,
     inputs_path: str,
@@ -1286,6 +1633,20 @@ def run_learning(
         - The best policies are chosen based on the average reward obtained during the evaluation runs, and they are saved for future use.
     """
     from assume.reinforcement_learning.buffer import ReplayBuffer
+
+    # If staggered (paired-scenario) training is enabled, the single-world
+    # training loop below cannot service it — direct the user to the dedicated
+    # entry point that builds and orchestrates two ``World`` instances.
+    learning_config = (
+        world.scenario_data.get("config", {}).get("learning_config", {}) or {}
+    )
+    staggered = learning_config.get("staggered_training", {}) or {}
+    if staggered.get("enabled"):
+        raise ValueError(
+            "Staggered training is enabled in learning_config. "
+            "Use `assume.scenario.loader_csv.run_staggered_learning(...)` "
+            "instead of `run_learning(...)` so that two paired worlds are constructed."
+        )
 
     if not verbose:
         logger.setLevel(logging.WARNING)
@@ -1435,6 +1796,71 @@ def run_learning(
         world=world,
         terminate_learning=True,
     )
+
+
+def run_staggered_learning(
+    inputs_path: str,
+    scenario: str,
+    study_case: str,
+    db_uri: str = "",
+    export_csv_path: str = "",
+    log_level: str = "INFO",
+    verbose: bool = False,
+) -> tuple[World, World]:
+    """Build two paired ``World`` instances and run D3 staggered MATD3 training.
+
+    The primary scenario folder must declare a
+    ``learning_config.staggered_training`` block listing exactly two scenarios
+    (the primary plus one paired scenario). Both worlds share the same
+    ``db_uri``/``export_csv_path``; their outputs are namespaced by the
+    scenario folder name so DB rows from the two worlds can be queried
+    separately (e.g. ``staggered_bau`` vs ``staggered_inv``).
+
+    Args:
+        inputs_path: Path to the inputs root (containing scenario folders).
+        scenario: Primary scenario folder name.
+        study_case: Study case key inside the primary scenario's ``config.yaml``.
+        db_uri: SQLAlchemy DB URI for both worlds (optional).
+        export_csv_path: CSV output path; learning suppresses it during training.
+        log_level: Log level forwarded to ``World``.
+        verbose: When true, the trainer keeps INFO logging enabled.
+
+    Returns:
+        Tuple ``(world_a, world_b)`` for inspection / further teardown by the caller.
+    """
+    from assume.reinforcement_learning.staggered_trainer import StaggeredTrainer
+
+    world_a = World(
+        database_uri=db_uri,
+        export_csv_path=export_csv_path,
+        log_level=log_level,
+    )
+    world_b = World(
+        database_uri=db_uri,
+        export_csv_path=export_csv_path,
+        log_level=log_level,
+    )
+
+    load_staggered_scenario(
+        worlds=[world_a, world_b],
+        inputs_path=inputs_path,
+        scenario=scenario,
+        study_case=study_case,
+    )
+
+    learning_config = (
+        world_a.scenario_data.get("config", {}).get("learning_config", {}) or {}
+    )
+    staggered_cfg = learning_config.get("staggered_training", {}) or {}
+    swap_order = staggered_cfg.get("swap_order_per_episode", True)
+
+    trainer = StaggeredTrainer(
+        worlds=[world_a, world_b],
+        swap_order_per_episode=swap_order,
+        verbose=verbose,
+    )
+    trainer.run()
+    return world_a, world_b
 
 
 if __name__ == "__main__":
