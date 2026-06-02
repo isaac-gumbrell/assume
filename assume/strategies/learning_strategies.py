@@ -1731,3 +1731,15 @@ class RenewableEnergyLearningSingleBidStrategyCongestion(
         congestion_foresight (int): Window length for congestion channels. Default 1.
         **kwargs: Forwarded to :class:`RenewableEnergyLearningSingleBidStrategy`.
     """
+
+
+class RenewableEnergyLearningCompatibleStrategyCongestion(
+    _CongestionObsMixin, RenewableEnergyLearningCompatibleStrategy
+):
+    """RenewableEnergyLearningCompatibleStrategy extended with per-line congestion observation channels.
+
+    Args:
+        n_lines (int): Number of transmission lines (required).
+        congestion_foresight (int): Window length for congestion channels. Default 1.
+        **kwargs: Forwarded to :class:`RenewableEnergyLearningCompatibleStrategy`.
+    """

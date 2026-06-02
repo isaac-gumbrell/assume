@@ -107,6 +107,7 @@ try:
         RenewableEnergyLearningSingleBidStrategy,
         RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
     )
 
     deprecated_bidding_strategies["pp_learning"] = EnergyLearningStrategy
@@ -138,6 +139,9 @@ try:
     )
     bidding_strategies["renewable_energy_learning_single_bid_congestion"] = (
         RenewableEnergyLearningSingleBidStrategyCongestion
+    )
+    bidding_strategies["renewable_energy_learning_compatible_congestion"] = (
+        RenewableEnergyLearningCompatibleStrategyCongestion
     )
 
     from assume.strategies.portfolio_learning_strategies import (
