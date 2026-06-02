@@ -201,13 +201,16 @@ def test_nodal_clearing_two_hours():
     assert math.isclose(meta[4]["price"], 32, abs_tol=eps)  # node3 hour 0
     assert math.isclose(meta[5]["price"], 29, abs_tol=eps)  # node3 hour 1
 
-    flows_df = pd.Series(flows).unstack()
-    assert math.isclose(flows_df.loc[products[0][0], "line_1_2"], 200, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][1], "line_1_2"], 600, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][0], "line_1_3"], 5000, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][1], "line_1_3"], 5000, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][0], "line_2_3"], 4800, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][1], "line_2_3"], 4400, abs_tol=eps)
+    # flows is now a long-format DataFrame (datetime index, columns: line, flow, congestion_pct)
+    assert isinstance(flows, pd.DataFrame)
+    assert {"line", "flow", "congestion_pct"}.issubset(flows.columns)
+    flows_wide = flows.pivot(columns="line", values="flow")
+    assert math.isclose(flows_wide.loc[products[0][0], "line_1_2"], 200, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][1], "line_1_2"], 600, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][0], "line_1_3"], 5000, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][1], "line_1_3"], 5000, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][0], "line_2_3"], 4800, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][1], "line_2_3"], 4400, abs_tol=eps)
 
 
 @pytest.mark.require_network
@@ -388,7 +391,128 @@ def test_nodal_clearing_with_storage_single_hour():
     assert math.isclose(meta[1]["price"], 21.5, abs_tol=eps)  # node2 hour 0
     assert math.isclose(meta[2]["price"], 32, abs_tol=eps)  # node3 hour 0
 
-    flows_df = pd.Series(flows).unstack()
-    assert math.isclose(flows_df.loc[products[0][0], "line_1_2"], 200, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][0], "line_1_3"], 5000, abs_tol=eps)
-    assert math.isclose(flows_df.loc[products[0][0], "line_2_3"], 4800, abs_tol=eps)
+    flows_wide = flows.pivot(columns="line", values="flow")
+    assert math.isclose(flows_wide.loc[products[0][0], "line_1_2"], 200, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][0], "line_1_3"], 5000, abs_tol=eps)
+    assert math.isclose(flows_wide.loc[products[0][0], "line_2_3"], 4800, abs_tol=eps)
+
+
+@pytest.mark.require_network
+def test_congestion_pct_in_flows():
+    """flows DataFrame carries congestion_pct; directional columns are used when present."""
+    market_config = simple_nodal_auction_config
+    h = 1
+    market_config.market_products = [
+        MarketProduct(timedelta(hours=1), h, timedelta(hours=1))
+    ]
+    market_config.additional_fields = ["bid_type", "node_id"]
+
+    nodes = pd.DataFrame(
+        {"name": ["node1", "node2", "node3"], "v_nom": [380.0, 380.0, 380.0]}
+    ).set_index("name")
+
+    # s_nom=5000; add directional columns to test directional normalisation
+    lines = pd.DataFrame(
+        {
+            "name": ["line_1_2", "line_1_3", "line_2_3"],
+            "bus0": ["node1", "node1", "node2"],
+            "bus1": ["node2", "node3", "node3"],
+            "s_nom": [5000.0, 5000.0, 5000.0],
+            "s_nom_forward": [5000.0, 5000.0, 5000.0],
+            "s_nom_reverse": [5000.0, 5000.0, 5000.0],
+            "x": [0.01, 0.01, 0.01],
+            "r": [0.001, 0.001, 0.001],
+        }
+    ).set_index("name")
+
+    generators = pd.DataFrame(
+        {
+            "name": [f"gen{p}" for p in range(5, 35)],
+            "node": ["node1"] * 10 + ["node2"] * 10 + ["node3"] * 10,
+            "max_power": [1000.0] * 30,
+        }
+    ).set_index("name")
+
+    loads = pd.DataFrame(
+        {
+            "name": ["dem1", "dem2", "dem3"],
+            "node": ["node1", "node2", "node3"],
+            "max_power": [4400.0, 4400.0, 17400.0],
+        }
+    ).set_index("name")
+
+    market_config.param_dict["grid_data"] = {
+        "buses": nodes,
+        "lines": lines,
+        "generators": generators,
+        "loads": loads,
+    }
+    market_config.param_dict["log_flows"] = True
+
+    next_opening = market_config.opening_hours.after(datetime(2005, 6, 1))
+    products = get_available_products(market_config.market_products, next_opening)
+
+    orderbook = []
+    order_base: Order = {
+        "start_time": products[0][0],
+        "end_time": products[0][1],
+        "unit_id": "placeholder",
+        "bid_id": "placeholder",
+        "volume": 0,
+        "price": 0,
+        "only_hours": None,
+        "node": "node1",
+    }
+    for v, node, bid_id, uid in [
+        (-2400, "node1", "dem1_0", "dem1"),
+        (-2400, "node2", "dem2_0", "dem2"),
+        (-17400, "node3", "dem3_0", "dem3"),
+    ]:
+        o = order_base.copy()
+        o.update(volume=v, price=3000, node=node, bid_id=bid_id, unit_id=uid)
+        orderbook.append(o)
+    for p in range(5, 35):
+        node = "node1" if p < 15 else ("node2" if p < 25 else "node3")
+        o = order_base.copy()
+        o.update(volume=1000, price=p, node=node, bid_id=f"gen{p}_0", unit_id=f"gen{p}")
+        orderbook.append(o)
+
+    mr = NodalClearingRole(market_config)
+    _, _, _, flows = mr.clear(orderbook, products)
+
+    assert isinstance(flows, pd.DataFrame), (
+        "flows must be a DataFrame when log_flows=True"
+    )
+    assert "congestion_pct" in flows.columns
+    assert "flow" in flows.columns
+
+    t0 = products[0][0]
+    row_1_3 = flows[(flows["line"] == "line_1_3") & (flows.index == t0)]
+    assert not row_1_3.empty
+    # line_1_3 carries ~5000 MW at s_nom=5000 → congestion_pct ~ 1.0
+    assert math.isclose(abs(row_1_3["congestion_pct"].iloc[0]), 1.0, abs_tol=0.01)
+
+    row_1_2 = flows[(flows["line"] == "line_1_2") & (flows.index == t0)]
+    assert not row_1_2.empty
+    expected = row_1_2["flow"].iloc[0] / 5000.0
+    assert math.isclose(row_1_2["congestion_pct"].iloc[0], expected, abs_tol=eps)
+
+
+def test_congestion_pct_symmetric_fallback():
+    """Without directional columns, congestion_pct uses s_nom as symmetric capacity."""
+    from assume.common.grid_utils import compute_flows_congestion_pct
+
+    t0 = datetime(2005, 6, 1, 0)
+    flow_df = pd.DataFrame(
+        {"line_A": [300.0, -400.0], "line_B": [0.0, 1000.0]},
+        index=pd.DatetimeIndex([t0, t0 + timedelta(hours=1)]),
+    )
+    lines = pd.DataFrame(
+        {"s_nom": [1000.0, 2000.0]}, index=pd.Index(["line_A", "line_B"], name="line")
+    )
+
+    result = compute_flows_congestion_pct(flow_df, lines)
+
+    assert math.isclose(result.loc[t0, "line_A"], 300.0 / 1000.0, abs_tol=eps)
+    assert math.isclose(result.iloc[1].loc["line_A"], -400.0 / 1000.0, abs_tol=eps)
+    assert math.isclose(result.iloc[1].loc["line_B"], 1000.0 / 2000.0, abs_tol=eps)

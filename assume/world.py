@@ -57,6 +57,37 @@ logging.getLogger("mango").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+class _WorldContainerActivation:
+    """Async context manager helper for :meth:`World.activate_container`.
+
+    Opens the world's mango container via :func:`mango.activate`, waits for
+    agents to be ready, and stores the active container reference on the
+    world so :meth:`World.async_run_chunk` can use it. Resets ``_first_chunk``
+    so the next chunk seeds the clock correctly.
+    """
+
+    def __init__(self, world: "World") -> None:
+        self._world = world
+        self._cm = None
+
+    async def __aenter__(self) -> Container:
+        logger.debug("activating container")
+        self._cm = activate(self._world.container)
+        c = await self._cm.__aenter__()
+        await tasks_complete_or_sleeping(c)
+        logger.debug("all agents up - starting simulation")
+        self._world._active_container = c
+        self._world._first_chunk = True
+        return c
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            return await self._cm.__aexit__(exc_type, exc, tb)
+        finally:
+            self._world._active_container = None
+            self._cm = None
+
+
 class World:
     """
     Orchestrates ASSUME simulation setup, execution, and output handling.
@@ -156,6 +187,11 @@ class World:
         self.units: dict[str, BaseUnit] = {}
         self.unit_types = unit_types
         self.dst_components = demand_side_technologies
+
+        # Held-open container state for chunked / staggered execution.
+        # See `activate_container()` and `async_run_chunk()`.
+        self._active_container: Container | None = None
+        self._first_chunk: bool = True
 
         self.bidding_strategies = bidding_strategies
         if "powerplant_energy_learning" not in bidding_strategies:
@@ -802,42 +838,90 @@ class World:
             start_ts (datetime.datetime): The start timestamp for the simulation run.
             end_ts (datetime.datetime): The end timestamp for the simulation run.
         """
-        self._validate_setup()
-
-        logger.debug("activating container")
-        # agent is implicit added to self.container._agents
-        async with activate(self.container) as c:
-            await tasks_complete_or_sleeping(c)
-            logger.debug("all agents up - starting simulation")
-
+        async with self.activate_container() as c:
             pbar = tqdm(total=end_ts - start_ts)
+            try:
+                await self.async_run_chunk(start_ts, end_ts, container=c, pbar=pbar)
+            finally:
+                pbar.close()
 
-            if isinstance(self.clock, ExternalClock):
+    def activate_container(self):
+        """
+        Async context manager that opens (and on exit closes) the mango container,
+        and waits for all agents to be ready. Use this to hold the container open
+        across multiple :meth:`async_run_chunk` calls (e.g. for chunked / staggered
+        training where two ``World`` instances advance in lockstep).
+
+        Returns:
+            An async context manager yielding the active mango container.
+        """
+        self._validate_setup()
+        return _WorldContainerActivation(self)
+
+    async def async_run_chunk(
+        self,
+        start_ts: datetime,
+        end_ts: datetime,
+        container: Container | None = None,
+        pbar: tqdm | None = None,
+    ):
+        """
+        Advance the simulation from ``start_ts`` to ``end_ts`` while the container
+        is already active.
+
+        Must be called from within an :meth:`activate_container` context. On the
+        first call after entering the context, the clock is initialised to
+        ``start_ts - 1`` (preserving the existing :meth:`async_run` semantics that
+        allow registration before the first market opening). Subsequent calls
+        continue from the current clock position.
+
+        Args:
+            start_ts: Start timestamp for the chunk (used only on the very first
+                chunk to seed the clock).
+            end_ts: End timestamp for the chunk; the loop exits once the clock
+                reaches this value.
+            container: Optional active container reference. Defaults to
+                ``self._active_container`` set by :meth:`activate_container`.
+            pbar: Optional progress bar to update. Chunked execution typically
+                runs without a pbar.
+        """
+        if container is None:
+            container = getattr(self, "_active_container", None)
+        if container is None:
+            raise RuntimeError(
+                "async_run_chunk requires the container to be active; "
+                "call inside `async with world.activate_container():`."
+            )
+
+        if isinstance(self.clock, ExternalClock):
+            if self._first_chunk:
                 # allow registration before first opening
                 self.clock.set_time(start_ts - 1)
                 if self.distributed_role is not False:
                     await self.clock_manager.broadcast(self.clock.time)
-                prev_delta = 0
-                while self.clock.time < end_ts:
-                    await asyncio.sleep(0)
-                    delta = await self._step(c)
-                    if delta or prev_delta:
+                self._first_chunk = False
+            prev_delta = 0
+            while self.clock.time < end_ts:
+                await asyncio.sleep(0)
+                delta = await self._step(container)
+                if delta or prev_delta:
+                    if pbar is not None:
                         pbar.update(delta)
                         pbar.set_description(
                             f"{self.simulation_desc} {timestamp2datetime(self.clock.time)}",
                             refresh=False,
                         )
-                    else:
-                        self.clock.set_time(end_ts)
-                    prev_delta = delta
-            else:
-                # real-time mode
-                while self.clock.time < end_ts:
-                    time = self.clock.time
-                    await asyncio.sleep(1)
-                    delta = self.clock.time - time
+                else:
+                    self.clock.set_time(end_ts)
+                prev_delta = delta
+        else:
+            # real-time mode
+            while self.clock.time < end_ts:
+                time = self.clock.time
+                await asyncio.sleep(1)
+                delta = self.clock.time - time
+                if pbar is not None:
                     pbar.update(delta)
-            pbar.close()
 
     def run(self):
         """

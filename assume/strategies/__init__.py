@@ -100,9 +100,13 @@ try:
     from assume.strategies.learning_strategies import (
         EnergyLearningStrategy,
         EnergyLearningSingleBidStrategy,
+        EnergyLearningStrategyCongestion,
+        EnergyLearningSingleBidStrategyCongestion,
         StorageEnergyLearningStrategy,
+        StorageEnergyLearningStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategy,
         RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningSingleBidStrategyCongestion,
     )
 
     deprecated_bidding_strategies["pp_learning"] = EnergyLearningStrategy
@@ -122,6 +126,18 @@ try:
     )
     bidding_strategies["renewable_energy_learning_compatible"] = (
         RenewableEnergyLearningCompatibleStrategy
+    )
+    bidding_strategies["powerplant_energy_learning_congestion"] = (
+        EnergyLearningStrategyCongestion
+    )
+    bidding_strategies["powerplant_energy_learning_single_bid_congestion"] = (
+        EnergyLearningSingleBidStrategyCongestion
+    )
+    bidding_strategies["storage_energy_learning_congestion"] = (
+        StorageEnergyLearningStrategyCongestion
+    )
+    bidding_strategies["renewable_energy_learning_single_bid_congestion"] = (
+        RenewableEnergyLearningSingleBidStrategyCongestion
     )
 
     from assume.strategies.portfolio_learning_strategies import (

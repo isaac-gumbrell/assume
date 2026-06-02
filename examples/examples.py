@@ -73,6 +73,15 @@ available_examples = {
         "scenario": "example_01h",
         "study_case": "eom",
     },
+    # Congestion-aware SRMC baseline + RL learning with congestion observations
+    "congestion_srmc_base": {
+        "scenario": "example_01j",
+        "study_case": "base",
+    },
+    "congestion_srmc_learning": {
+        "scenario": "example_01j",
+        "study_case": "learning",
+    },
     #
     # DRL references case for learning advancement testing
     "small_learning_1": {"scenario": "example_02a", "study_case": "base"},

@@ -84,6 +84,7 @@ User Guide
 * :doc:`bidding_strategies`
 * :doc:`learning`
 * :doc:`learning_algorithm`
+* :doc:`staggered_training`
 * :doc:`support_policies`
 * :doc:`distributed_simulation`
 * :doc:`manual_simulation`
@@ -106,6 +107,7 @@ User Guide
    bidding_strategies
    learning
    learning_algorithm
+   staggered_training
    support_policies
    distributed_simulation
    manual_simulation

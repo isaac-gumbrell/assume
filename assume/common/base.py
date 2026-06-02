@@ -873,6 +873,20 @@ class LearningConfig:
     load_replay_buffer: bool = False
     replay_buffer_load_path: str | None = None
 
+    # Optional staggered (paired-scenario) training config — see D3 spec.
+    # Expected shape:
+    #   {
+    #       "enabled": bool,                       # default false
+    #       "scenarios": [                         # exactly two scenario refs
+    #           {"path": "<rel/abs path>", "name": "<db-safe id>"},
+    #           ...,
+    #       ],
+    #       "swap_order_per_episode": bool,        # default true
+    #   }
+    # When disabled (or absent), training proceeds in the original single-world
+    # path with bit-identical behaviour to before this field was added.
+    staggered_training: dict | None = None
+
     def __post_init__(self):
         """Calculate defaults that depend on other fields and validate inputs."""
         if self.early_stopping_steps is None:

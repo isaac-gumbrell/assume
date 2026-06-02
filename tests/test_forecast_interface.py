@@ -17,6 +17,8 @@ from assume.common.forecast_algorithms import (
     calculate_naive_price_inelastic,
     calculate_naive_renewable_utilisation,
     calculate_naive_residual_load,
+    congestion_signal_lines_from_df,
+    congestion_signal_lines_load_from_df,
     get_forecast_registries,
 )
 from assume.common.forecaster import (
@@ -412,3 +414,71 @@ def test_forecast_interface__cache(market_setup, forecast_setup):
     # NOTE: only missed once & no hits due to lru_cache also on calculate_naive_price
     assert calculate_naive_price_inelastic.cache_info().hits == 0
     assert calculate_naive_price_inelastic.cache_info().misses == 1
+
+
+# ---------------------------------------------------------------------------
+# D2: congestion_signal_lines_from_df / congestion_signal_lines_load_from_df
+# ---------------------------------------------------------------------------
+
+
+def test_congestion_lines_load_from_df(index, shared_FastIndex):
+    """Preprocess algorithm extracts *_congestion_signal columns into a keyed dict."""
+    forecast_df = pd.DataFrame(
+        {
+            "Line_A_congestion_signal": [0.1] * len(index),
+            "Line_B_congestion_signal": [0.5] * len(index),
+            "price_EOM": [50.0] * len(index),  # should be ignored
+        },
+        index=index,
+    )
+
+    result = congestion_signal_lines_load_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        forecast_df=forecast_df,
+    )
+
+    assert set(result.keys()) == {"Line_A", "Line_B"}
+    assert list(result["Line_A"]) == pytest.approx([0.1] * len(index))
+    assert list(result["Line_B"]) == pytest.approx([0.5] * len(index))
+
+
+def test_congestion_lines_from_df_round_trip(index, shared_FastIndex):
+    """Init algorithm returns preprocess_information unchanged (non-empty)."""
+    preprocess_info = {
+        "line_X": pd.Series([0.3] * len(index), index=index),
+    }
+
+    result = congestion_signal_lines_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        preprocess_information=preprocess_info,
+    )
+
+    assert result is preprocess_info
+
+
+def test_congestion_lines_from_df_empty_fallback(shared_FastIndex):
+    """Init algorithm returns {} when preprocess_information is None."""
+    result = congestion_signal_lines_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        preprocess_information=None,
+    )
+
+    assert result == {}
+
+
+def test_congestion_lines_load_from_df_no_forecast(shared_FastIndex):
+    """Preprocess algorithm returns {} when forecast_df is None (no crash)."""
+    result = congestion_signal_lines_load_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        forecast_df=None,
+    )
+
+    assert result == {}

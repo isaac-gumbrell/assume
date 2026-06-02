@@ -340,6 +340,65 @@ def calculate_network_meta(network, product: MarketProduct, i: int):
     return meta
 
 
+def compute_flows_congestion_pct(
+    flow_df: pd.DataFrame, lines: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Compute per-line congestion percentage from a wide-format flows DataFrame.
+
+    ``congestion_pct = flow / capacity``, where capacity is direction-aware:
+
+    - ``flow > 0``  → ``s_nom_forward`` (bus0 → bus1), if present and valid
+    - ``flow ≤ 0``  → ``s_nom_reverse`` (bus1 → bus0), if present and valid
+    - Falls back to ``s_nom * s_max_pu`` (or ``s_nom``) for lines without
+      directional columns or with NaN / zero directional values.
+
+    The OPF guarantees values are bounded to ``[-1, 1]``.  Lines that are not
+    found in *lines* are assigned ``0.0``.
+
+    Args:
+        flow_df: DataFrame with index = datetime, columns = line_id, values = MW flow.
+        lines:   DataFrame with index = line_id, at minimum a ``s_nom`` column.
+                 Optionally ``s_nom_forward``, ``s_nom_reverse``, ``s_max_pu``.
+
+    Returns:
+        DataFrame with the same shape as *flow_df*, values in ``[-1, 1]``.
+    """
+    has_directional = (
+        "s_nom_forward" in lines.columns and "s_nom_reverse" in lines.columns
+    )
+
+    congestion_df = pd.DataFrame(0.0, index=flow_df.index, columns=flow_df.columns)
+
+    for line_id in flow_df.columns:
+        if line_id not in lines.index:
+            continue
+
+        flow_vals = flow_df[line_id].values
+
+        if has_directional:
+            cap_f = lines.at[line_id, "s_nom_forward"]
+            cap_r = lines.at[line_id, "s_nom_reverse"]
+            if not pd.isna(cap_f) and not pd.isna(cap_r) and cap_f > 0 and cap_r > 0:
+                congestion_df[line_id] = np.where(
+                    flow_vals > 0, flow_vals / cap_f, flow_vals / cap_r
+                )
+                continue
+
+        # Symmetric fallback
+        s_max_pu = (
+            lines.at[line_id, "s_max_pu"]
+            if "s_max_pu" in lines.columns
+            and not pd.isna(lines.at[line_id, "s_max_pu"])
+            else 1.0
+        )
+        capacity = lines.at[line_id, "s_nom"] * s_max_pu
+        if capacity != 0:
+            congestion_df[line_id] = flow_vals / capacity
+
+    return congestion_df
+
+
 def get_supported_solver_linopy(default_solver: str | None = None):
     """
     Get an available solver for linopy optimization.

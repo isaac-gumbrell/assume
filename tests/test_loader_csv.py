@@ -194,3 +194,101 @@ def test_forecast_interface__save_forecasts():
         saved_forecasts["residual_load_naive_forecast_EOM"]
         == expected_load["load_forecast"]
     ).all()
+
+
+def test_load_srmc_congestion_from_db():
+    """load_srmc_congestion_from_db pivots grid_flows rows into *_congestion_signal columns."""
+    import tempfile
+
+    from sqlalchemy import create_engine
+
+    from assume.scenario.loader_csv import load_srmc_congestion_from_db
+
+    index = pd.date_range("2024-01-01", periods=3, freq="h")
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    db_uri = f"sqlite:///{db_path}"
+
+    engine = create_engine(db_uri)
+    rows = [
+        {
+            "datetime": index[0],
+            "line": "L1",
+            "flow": 100.0,
+            "congestion_pct": 0.2,
+            "simulation": "srmc_run",
+        },
+        {
+            "datetime": index[1],
+            "line": "L1",
+            "flow": 200.0,
+            "congestion_pct": 0.4,
+            "simulation": "srmc_run",
+        },
+        {
+            "datetime": index[2],
+            "line": "L1",
+            "flow": 300.0,
+            "congestion_pct": 0.6,
+            "simulation": "srmc_run",
+        },
+        {
+            "datetime": index[0],
+            "line": "L2",
+            "flow": 50.0,
+            "congestion_pct": 0.1,
+            "simulation": "srmc_run",
+        },
+        {
+            "datetime": index[1],
+            "line": "L2",
+            "flow": 50.0,
+            "congestion_pct": 0.1,
+            "simulation": "srmc_run",
+        },
+        {
+            "datetime": index[2],
+            "line": "L2",
+            "flow": 50.0,
+            "congestion_pct": 0.1,
+            "simulation": "srmc_run",
+        },
+    ]
+    df = pd.DataFrame(rows)
+    df.to_sql("grid_flows", engine, index=False, if_exists="replace")
+    engine.dispose()
+
+    result = load_srmc_congestion_from_db(db_uri, "srmc_run", index)
+
+    assert set(result.columns) == {"L1_congestion_signal", "L2_congestion_signal"}
+    assert len(result) == 3
+    assert result.index.equals(index)
+    assert pytest.approx(result["L1_congestion_signal"].tolist()) == [0.2, 0.4, 0.6]
+    assert pytest.approx(result["L2_congestion_signal"].tolist()) == [0.1, 0.1, 0.1]
+
+    # Clean up temp file
+    import os
+
+    os.unlink(db_path)
+
+
+def test_load_srmc_congestion_from_db_missing_table():
+    """Returns empty DataFrame (no error) when grid_flows table does not exist."""
+    import tempfile
+
+    from assume.scenario.loader_csv import load_srmc_congestion_from_db
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    db_uri = f"sqlite:///{db_path}"
+    index = pd.date_range("2024-01-01", periods=3, freq="h")
+
+    result = load_srmc_congestion_from_db(db_uri, "nonexistent", index)
+
+    assert result.empty
+    assert list(result.index) == list(index)
+
+    import os
+
+    os.unlink(db_path)
