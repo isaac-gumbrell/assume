@@ -422,11 +422,11 @@ def test_forecast_interface__cache(market_setup, forecast_setup):
 
 
 def test_congestion_lines_load_from_df(index, shared_FastIndex):
-    """Preprocess algorithm extracts *_congestion_signal columns into a keyed dict."""
+    """Preprocess algorithm extracts congestion_{line_id} columns into a keyed dict."""
     forecast_df = pd.DataFrame(
         {
-            "Line_A_congestion_signal": [0.1] * len(index),
-            "Line_B_congestion_signal": [0.5] * len(index),
+            "congestion_Line_A": [0.1] * len(index),
+            "congestion_Line_B": [0.5] * len(index),
             "price_EOM": [50.0] * len(index),  # should be ignored
         },
         index=index,
@@ -482,3 +482,57 @@ def test_congestion_lines_load_from_df_no_forecast(shared_FastIndex):
     )
 
     assert result == {}
+
+
+def test_congestion_lines_load_from_df_prefix_naming(index, shared_FastIndex):
+    """Preprocess algorithm recognises ``congestion_{line_id}`` prefix columns."""
+    forecast_df = pd.DataFrame(
+        {
+            "congestion_AKL_Centre-AKL_West": [0.2] * len(index),
+            "congestion_ARI_South-BoP": [0.8] * len(index),
+            "price_EOM": [50.0] * len(index),  # should be ignored
+        },
+        index=index,
+    )
+
+    result = congestion_signal_lines_load_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        forecast_df=forecast_df,
+    )
+
+    assert set(result.keys()) == {"AKL_Centre-AKL_West", "ARI_South-BoP"}
+    assert list(result["AKL_Centre-AKL_West"]) == pytest.approx([0.2] * len(index))
+    assert list(result["ARI_South-BoP"]) == pytest.approx([0.8] * len(index))
+
+
+def test_congestion_lines_from_df_returns_empty_when_no_df_data(shared_FastIndex):
+    """Default (from_df) returns {} when preprocess found nothing — gives zero RL obs."""
+    result = congestion_signal_lines_from_df(
+        shared_FastIndex,
+        units=[],
+        market_configs=[],
+        preprocess_information={},
+    )
+    assert result == {}
+
+
+def test_congestion_lines_naive_is_explicit_opt_in(shared_FastIndex, market_setup):
+    """congestion_signal_line_naive_forecast is available as an explicit opt-in algorithm."""
+    from assume.common.forecast_algorithms import (
+        calculate_naive_line_congestion_signal,
+        get_forecast_registries,
+    )
+
+    calculate_naive_line_congestion_signal.cache_clear()
+    registries = get_forecast_registries()
+    alg = registries["init"]["congestion_signal_line_naive_forecast"]
+    # Should be callable and produce the same result as calling directly
+    result = alg(
+        shared_FastIndex,
+        units=tuple([]),
+        market_configs=tuple(market_setup["market_configs"]),
+        preprocess_information=None,
+    )
+    assert isinstance(result, dict)

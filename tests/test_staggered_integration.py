@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from assume.scenario.loader_csv import (
+    _check_staggered_input_file_parity,
     load_staggered_scenario,
     run_staggered_learning,
 )
@@ -233,3 +234,67 @@ def test_run_staggered_learning_writes_namespaced_db_rows(tmp_path):
         )
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# _check_staggered_input_file_parity — file-presence validation
+# ---------------------------------------------------------------------------
+
+
+def test_input_file_parity_matching_scenarios_no_warning(tmp_path, caplog):
+    """No warning when both scenario folders contain exactly the same CSV files."""
+    import logging
+
+    scen_a = tmp_path / "scen_a"
+    scen_b = tmp_path / "scen_b"
+    scen_a.mkdir()
+    scen_b.mkdir()
+
+    for scen in (scen_a, scen_b):
+        (scen / "forecasts_df.csv").write_text("datetime\n2045-01-01\n")
+        (scen / "fuel_prices_df.csv").write_text("datetime\n2045-01-01\n")
+
+    with caplog.at_level(logging.WARNING, logger="assume.scenario.loader_csv"):
+        _check_staggered_input_file_parity([str(scen_a), str(scen_b)], ["bau", "inv"])
+
+    assert "mismatch" not in caplog.text.lower()
+
+
+def test_input_file_parity_missing_forecasts_df_warns(tmp_path, caplog):
+    """Warning is raised when one scenario is missing forecasts_df.csv."""
+    import logging
+
+    scen_a = tmp_path / "scen_a"
+    scen_b = tmp_path / "scen_b"
+    scen_a.mkdir()
+    scen_b.mkdir()
+
+    # scen_a has forecasts_df.csv; scen_b does not
+    (scen_a / "forecasts_df.csv").write_text("datetime\n2045-01-01\n")
+    (scen_a / "fuel_prices_df.csv").write_text("datetime\n2045-01-01\n")
+    (scen_b / "fuel_prices_df.csv").write_text("datetime\n2045-01-01\n")
+
+    with caplog.at_level(logging.WARNING, logger="assume.scenario.loader_csv"):
+        _check_staggered_input_file_parity([str(scen_a), str(scen_b)], ["bau", "inv"])
+
+    assert "mismatch" in caplog.text.lower()
+    assert "forecasts_df.csv" in caplog.text
+
+
+def test_input_file_parity_unit_csvs_are_ignored(tmp_path, caplog):
+    """Unit-definition CSVs (powerplant_units etc.) do not trigger a warning."""
+    import logging
+
+    scen_a = tmp_path / "scen_a"
+    scen_b = tmp_path / "scen_b"
+    scen_a.mkdir()
+    scen_b.mkdir()
+
+    # scen_a has extra powerplant_units.csv; scen_b does not
+    (scen_a / "powerplant_units.csv").write_text("name\npp1\n")
+    (scen_a / "storage_units.csv").write_text("name\nst1\n")
+
+    with caplog.at_level(logging.WARNING, logger="assume.scenario.loader_csv"):
+        _check_staggered_input_file_parity([str(scen_a), str(scen_b)], ["bau", "inv"])
+
+    assert "mismatch" not in caplog.text.lower()

@@ -754,14 +754,15 @@ def congestion_signal_lines_load_from_df(
     initializing_unit=None,
 ) -> dict[str, FastSeries]:
     """
-    Preprocess algorithm: extract ``{line_id}_congestion_signal`` columns from *forecast_df*.
+    Preprocess algorithm: extract per-line congestion columns from *forecast_df*.
 
     Used together with :func:`congestion_signal_lines_from_df` as the init algorithm to
     load a frozen SRMC congestion forecast into the forecaster at scenario-setup time.
+    Also serves as the default ``preprocess_congestion_signal_lines`` algorithm so that
+    congestion forecasts in *forecast_df* are picked up automatically, mirroring how
+    price columns (``price_{market_id}``) are handled by :func:`calculate_base_forecasts`.
 
-    Column naming convention: columns whose names end in ``_congestion_signal`` are
-    treated as per-line signals; the part before ``_congestion_signal`` becomes the
-    ``line_id`` key in the returned dict.
+    Column naming convention: ``congestion_{line_id}``
 
     Args:
         index: Time index for the forecaster.
@@ -777,9 +778,9 @@ def congestion_signal_lines_load_from_df(
     if forecast_df is None:
         return {}
 
-    suffix = "_congestion_signal"
+    prefix = "congestion_"
     cols = {
-        col[: -len(suffix)]: col for col in forecast_df.columns if col.endswith(suffix)
+        col[len(prefix) :]: col for col in forecast_df.columns if col.startswith(prefix)
     }
     if not cols:
         return {}
@@ -808,18 +809,19 @@ def congestion_signal_lines_from_df(
     Init algorithm: return the ``dict[str, FastSeries]`` loaded by the paired
     :func:`congestion_signal_lines_load_from_df` preprocess algorithm.
 
-    Configure a unit's forecaster with::
+    Use when you want to **force** the forecast-from-df path and skip the naive
+    fallback.  Pair with the preprocess algorithm explicitly::
 
         forecast_algorithms:
           congestion_signal_lines: congestion_signal_lines_from_df
           preprocess_congestion_signal_lines: congestion_signal_lines_load_from_df
 
-    and provide ``{line_id}_congestion_signal`` columns in *forecasts_df* (typically
-    loaded from the SRMC pass via ``srmc_congestion_simulation_id`` in the config).
-
     Returns an empty dict when *preprocess_information* is ``None`` or empty, so that
     the :class:`~assume.strategies.learning_strategies._CongestionObsMixin` zero-grid
     fallback activates cleanly.
+
+    .. seealso:: :func:`congestion_signal_lines_auto` for the default auto-detect
+        algorithm that tries the df first and falls back to naive.
     """
     return preprocess_information or {}
 

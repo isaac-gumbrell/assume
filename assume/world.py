@@ -963,6 +963,7 @@ class World:
         # and references to old unit/config objects from previous episodes.
         from assume.common.forecast_algorithms import (
             calculate_naive_congestion_signal,
+            calculate_naive_line_congestion_signal,
             calculate_naive_price,
             calculate_naive_price_elastic,
             calculate_naive_price_inelastic,
@@ -977,6 +978,7 @@ class World:
         calculate_naive_price.cache_clear()
         calculate_naive_residual_load.cache_clear()
         calculate_naive_congestion_signal.cache_clear()
+        calculate_naive_line_congestion_signal.cache_clear()
         calculate_naive_renewable_utilisation.cache_clear()
 
     def add_unit(

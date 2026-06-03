@@ -472,7 +472,7 @@ def load_srmc_congestion_from_db(
 
     Queries the ``grid_flows`` table for the given *simulation_id*, extracts the
     ``congestion_pct`` column, pivots to wide format, and renames each column to
-    ``{line_id}_congestion_signal`` so it is consumed by the
+    ``congestion_{line_id}`` so it is consumed by the
     ``congestion_signal_lines_load_from_df`` preprocess algorithm.
 
     The result is reindexed to *index* using forward-fill to handle any gaps between
@@ -534,7 +534,7 @@ def load_srmc_congestion_from_db(
     wide = df.pivot_table(
         index="datetime", columns="line", values="congestion_pct", aggfunc="first"
     )
-    wide.columns = [f"{col}_congestion_signal" for col in wide.columns]
+    wide.columns = [f"congestion_{col}" for col in wide.columns]
     wide.index = pd.to_datetime(wide.index)
 
     # Reindex to scenario horizon; forward-fill gaps, then back-fill leading NaNs
@@ -609,10 +609,10 @@ def save_unique_forecasts(units, save_path: Path) -> None:
             else:
                 forecast_dict[f"{f_name}"] = forecast.as_pd_series(name=f"{f_name}")
 
-    # Export per-line congestion signals as {line_id}_congestion_signal columns
+    # Export per-line congestion signals as congestion_{line_id} columns
     for _f_name, unit in unique_line_congestion_units.items():
         for line_id, series in unit.forecaster.congestion_signal_lines.items():
-            col_name = f"{line_id}_congestion_signal"
+            col_name = f"congestion_{line_id}"
             forecast_dict[col_name] = series.as_pd_series(name=col_name)
 
     if not forecast_dict:
@@ -1372,6 +1372,57 @@ def build_staggered_supersets(
     return local_ids, extra_units_per_scenario
 
 
+# Files that are allowed to differ between paired scenarios (they are merged /
+# neutralised by the superset mechanism, so a mismatch is expected and benign).
+_STAGGERED_UNIT_CSVS = {
+    "powerplant_units.csv",
+    "storage_units.csv",
+    "demand_units.csv",
+}
+
+
+def _check_staggered_input_file_parity(
+    scenario_paths: list[str], names: list[str]
+) -> None:
+    """Warn when paired staggered scenarios have mismatched optional input files.
+
+    Compares the set of ``.csv`` files present in each scenario folder, ignoring
+    the unit-definition CSVs (which are intentionally different between scenarios
+    and are handled by the superset mechanism) and any ``.license`` sidecars.
+
+    A mismatch usually means a frozen forecast (e.g. ``forecasts_df.csv``) was
+    prepared for one scenario but not the other.  Without it the missing scenario
+    silently falls back to the naive congestion / price signal.
+
+    Args:
+        scenario_paths: Filesystem paths to the two scenario folders.
+        names:          Logical scenario names (for log messages).
+    """
+    csv_sets: list[set[str]] = []
+    for sp in scenario_paths:
+        p = Path(sp)
+        files = {f.name for f in p.glob("*.csv") if f.name not in _STAGGERED_UNIT_CSVS}
+        csv_sets.append(files)
+
+    only_in_first = csv_sets[0] - csv_sets[1]
+    only_in_second = csv_sets[1] - csv_sets[0]
+
+    if only_in_first or only_in_second:
+        logger.warning(
+            "Staggered scenario input file mismatch detected — forecasts may differ "
+            "between worlds.  Files present in '%s' but missing from '%s': %s.  "
+            "Files present in '%s' but missing from '%s': %s.  "
+            "Ensure both scenarios have the same optional input files (e.g. "
+            "forecasts_df.csv) so that forecast signals are consistent.",
+            names[0],
+            names[1],
+            sorted(only_in_first) or "none",
+            names[1],
+            names[0],
+            sorted(only_in_second) or "none",
+        )
+
+
 def load_staggered_scenario(
     worlds: list[World],
     inputs_path: str,
@@ -1442,6 +1493,12 @@ def load_staggered_scenario(
         if not p.exists():
             raise FileNotFoundError(f"Staggered scenario path does not exist: {p}")
         scenario_paths.append(str(p))
+
+    # Validate that both scenario folders contain the same optional input files.
+    # A mismatch (e.g. one scenario has forecasts_df.csv and the other doesn't)
+    # typically means a frozen forecast was forgotten, which silently degrades to
+    # naive signals for the scenario that is missing the file.
+    _check_staggered_input_file_parity(scenario_paths, names)
 
     # Build the unit supersets across both scenarios.
     _local_ids, extras_by_path = build_staggered_supersets(scenario_paths)
