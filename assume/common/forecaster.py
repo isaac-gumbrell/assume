@@ -232,6 +232,7 @@ class UnitForecaster:
         Algorithm keys (defaults):
             - ``preprocess_price`` (``price_default``)
             - ``preprocess_residual_load`` (``residual_load_default``)
+            - ``preprocess_congestion_signal_lines`` (``congestion_signal_lines_load_from_df``)
 
         Args:
             units (list[BaseUnit]): All units in the simulation.
@@ -264,7 +265,8 @@ class UnitForecaster:
 
         congestion_signal_lines_preprocess_algorithm_name = (
             self.forecast_algorithms.get(
-                "preprocess_congestion_signal_lines", "congestion_signal_lines_default"
+                "preprocess_congestion_signal_lines",
+                "congestion_signal_lines_load_from_df",
             )
         )
         congestion_signal_lines_preprocess_algorithm = self._registries[
@@ -292,6 +294,10 @@ class UnitForecaster:
         Algorithm keys (defaults):
             - ``price`` (``price_naive_forecast``)
             - ``residual_load`` (``residual_load_naive_forecast``)
+            - ``congestion_signal_lines`` (``congestion_signal_lines_from_df``): uses
+              ``congestion_*`` or ``*_congestion_signal`` columns from *forecast_df*;
+              returns ``{}`` (zero observations) when no matching columns are present.
+              Use ``congestion_signal_line_naive_forecast`` to compute from physics instead.
 
         Args:
             units (list[BaseUnit]): All units in the simulation.
@@ -343,7 +349,7 @@ class UnitForecaster:
 
         # 3. Get per-line congestion signal forecast
         congestion_signal_lines_alg_name = self.forecast_algorithms.get(
-            "congestion_signal_lines", "congestion_signal_line_naive_forecast"
+            "congestion_signal_lines", "congestion_signal_lines_from_df"
         )
         congestion_signal_lines_alg = self._registries["init"].get(
             congestion_signal_lines_alg_name
