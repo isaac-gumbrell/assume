@@ -1480,7 +1480,7 @@ def load_staggered_scenario(
         # ``staggered_scenario_name`` for metric reporting.
         if base_sim_id is None:
             base_sim_id = world.scenario_data["simulation_id"]
-        world.scenario_data["simulation_id"] = scenario_name
+        world.scenario_data["simulation_id"] = f"{scenario_name}_{study_case}"
         world.scenario_data["staggered_scenario_name"] = name
 
         # Setup the world
