@@ -308,6 +308,14 @@ class StaggeredTrainer:
                 self.anchor.learning_role.rl_algorithm.save_params(
                     directory=f"{learning_config.trained_policies_save_path}/last_policies"
                 )
+                lc = self.anchor.learning_role.learning_config
+                if getattr(lc, "save_replay_buffer", True):
+                    buf = self.anchor.learning_role.buffer
+                    if buf is not None:
+                        buf_path = getattr(lc, "replay_buffer_save_path", None) or (
+                            f"{lc.trained_policies_save_path}/last_policies/replay_buffer.npz"
+                        )
+                        buf.save(buf_path)
 
         logger.info("################")
         logger.info("Staggered training finished, starting evaluation run")
