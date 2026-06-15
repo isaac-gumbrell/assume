@@ -22,6 +22,8 @@ mango containers so they stay in the fast suite.
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -29,6 +31,7 @@ import pytest
 
 from assume.common.base import LearningConfig
 from assume.reinforcement_learning.staggered_trainer import (
+    StaggeredTrainer,
     _chunk_boundaries,
     _ensure_persistent_loop,
 )
@@ -261,6 +264,222 @@ def test_ensure_persistent_loop_aligns_secondary_to_anchor():
         secondary_loop.close()
         # Restore a fresh loop for any subsequent tests.
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def test_run_learning_resume_skips_training_and_keeps_tensorboard(
+    tmp_path, monkeypatch
+):
+    """Resume mode should keep existing TensorBoard logs and skip training if
+    loaded episodes already reach the configured training horizon.
+    """
+
+    class FakeLearningRole:
+        def __init__(self, learning_config):
+            self.learning_config = learning_config
+            self.rl_algorithm = SimpleNamespace(
+                initialize_policy=lambda: None,
+                obs_dim=1,
+                act_dim=1,
+            )
+            self.rl_strats = {"u1": SimpleNamespace()}
+            self.device = "cpu"
+            self.float_type = None
+            self.buffer = None
+            self.episodes_done = 0
+            self.eval_episodes_done = 0
+
+        def load_inter_episodic_data(self, data):
+            self.buffer = data["buffer"]
+
+        def determine_validation_interval(self):
+            return 1
+
+        def sync_train_freq_with_simulation_horizon(self):
+            return "1h"
+
+        def load_runtime_state(self, path):
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.episodes_done = int(payload.get("episodes_done", 0))
+            self.eval_episodes_done = int(payload.get("eval_episodes_done", 0))
+
+        def get_inter_episodic_data(self):
+            return {
+                "buffer": self.buffer,
+                "actors_and_critics": None,
+                "max_eval": {},
+                "all_eval": {},
+                "avg_all_eval": [],
+                "episodes_done": self.episodes_done,
+                "eval_episodes_done": self.eval_episodes_done,
+            }
+
+    save_dir = tmp_path / "learned"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    state_path = save_dir / "last_policies" / "learning_state.pt"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"episodes_done": 2, "eval_episodes_done": 4}),
+        encoding="utf-8",
+    )
+
+    sim_id = "resume_single_world"
+    tb_dir = Path("tensorboard") / sim_id
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    marker = tb_dir / "keep_me.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    lc = LearningConfig(
+        learning_mode=True,
+        training_episodes=2,
+        episodes_collecting_initial_experience=1,
+        train_freq="1h",
+        trained_policies_save_path=str(save_dir),
+        load_learning_state=True,
+        learning_state_load_path=str(state_path),
+    )
+
+    fake_world = SimpleNamespace(
+        scenario_data={
+            "simulation_id": sim_id,
+            "config": {"learning_config": {}},
+        },
+        learning_role=FakeLearningRole(lc),
+        export_csv_path="",
+        run=lambda: None,
+        reset=lambda: None,
+        db_uri="",
+    )
+
+    monkeypatch.setattr(
+        "assume.scenario.loader_csv.confirm_learning_save_path", lambda *_: None
+    )
+    monkeypatch.setattr("assume.scenario.loader_csv.setup_world", lambda **_: None)
+
+    run_learning(fake_world)
+
+    assert marker.exists(), "TensorBoard directory should be preserved in resume mode"
+
+
+def test_staggered_trainer_resume_skips_training_and_keeps_tensorboard(
+    tmp_path, monkeypatch
+):
+    """Staggered trainer in resume mode should preserve TensorBoard dirs and
+    skip training when loaded episodes already complete the horizon.
+    """
+
+    class FakeLearningRole:
+        def __init__(self, learning_config):
+            self.learning_config = learning_config
+            self.rl_algorithm = SimpleNamespace(
+                initialize_policy=lambda: None,
+                obs_dim=1,
+                act_dim=1,
+            )
+            self.rl_strats = {"u1": SimpleNamespace()}
+            self.device = "cpu"
+            self.float_type = None
+            self.buffer = None
+            self.episodes_done = 0
+            self.eval_episodes_done = 0
+
+        def load_inter_episodic_data(self, data):
+            self.buffer = data["buffer"]
+
+        def determine_validation_interval(self):
+            return 1
+
+        def sync_train_freq_with_simulation_horizon(self):
+            return "1h"
+
+        def load_runtime_state(self, path):
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.episodes_done = int(payload.get("episodes_done", 0))
+            self.eval_episodes_done = int(payload.get("eval_episodes_done", 0))
+
+        def get_inter_episodic_data(self):
+            return {
+                "buffer": self.buffer,
+                "actors_and_critics": None,
+                "max_eval": {},
+                "all_eval": {},
+                "avg_all_eval": [],
+                "episodes_done": self.episodes_done,
+                "eval_episodes_done": self.eval_episodes_done,
+            }
+
+        tensor_board_logger = SimpleNamespace(update_tensorboard=lambda: None)
+
+    save_dir = tmp_path / "learned_staggered"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    state_path = save_dir / "last_policies" / "learning_state.pt"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"episodes_done": 2, "eval_episodes_done": 3}),
+        encoding="utf-8",
+    )
+
+    lc = LearningConfig(
+        learning_mode=True,
+        training_episodes=2,
+        episodes_collecting_initial_experience=1,
+        train_freq="1h",
+        trained_policies_save_path=str(save_dir),
+        load_learning_state=True,
+        learning_state_load_path=str(state_path),
+    )
+
+    shared_loop = asyncio.new_event_loop()
+    sim_a = "resume_staggered_a"
+    sim_b = "resume_staggered_b"
+    tb_a = Path("tensorboard") / sim_a
+    tb_b = Path("tensorboard") / sim_b
+    tb_a.mkdir(parents=True, exist_ok=True)
+    tb_b.mkdir(parents=True, exist_ok=True)
+    marker_a = tb_a / "keep_me.txt"
+    marker_b = tb_b / "keep_me.txt"
+    marker_a.write_text("keep", encoding="utf-8")
+    marker_b.write_text("keep", encoding="utf-8")
+
+    world_a = SimpleNamespace(
+        scenario_data={"simulation_id": sim_a, "config": {"learning_config": {}}},
+        simulation_id=sim_a,
+        learning_role=FakeLearningRole(lc),
+        export_csv_path="",
+        reset=lambda: None,
+        loop=shared_loop,
+    )
+    world_b = SimpleNamespace(
+        scenario_data={"simulation_id": sim_b, "config": {"learning_config": {}}},
+        simulation_id=sim_b,
+        learning_role=FakeLearningRole(lc),
+        export_csv_path="",
+        reset=lambda: None,
+        loop=shared_loop,
+    )
+
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer._share_learning_state",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer._ensure_persistent_loop",
+        lambda worlds: worlds[0].loop,
+    )
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer.confirm_learning_save_path",
+        lambda *_: None,
+    )
+    monkeypatch.setattr("assume.scenario.loader_csv.setup_world", lambda **_: None)
+
+    try:
+        trainer = StaggeredTrainer([world_a, world_b], verbose=False)
+        trainer.run()
+    finally:
+        shared_loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    assert marker_a.exists(), "Anchor TensorBoard directory should be preserved"
+    assert marker_b.exists(), "Secondary TensorBoard directory should be preserved"
 
 
 # ---------------------------------------------------------------------------

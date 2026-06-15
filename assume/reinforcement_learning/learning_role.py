@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -410,6 +411,109 @@ class Learning(Role):
             "buffer": self.buffer,
             "actors_and_critics": self.rl_algorithm.extract_policy(),
         }
+
+    def export_runtime_state(self) -> dict:
+        """Export mutable runtime state for crash-resume checkpointing."""
+        strategy_state = {}
+        for u_id, strategy in self.rl_strats.items():
+            strategy_payload = {
+                "collect_initial_experience_mode": bool(
+                    getattr(strategy, "collect_initial_experience_mode", True)
+                )
+            }
+            action_noise = getattr(strategy, "action_noise", None)
+            if action_noise is not None and hasattr(action_noise, "dt"):
+                strategy_payload["action_noise_dt"] = float(action_noise.dt)
+            strategy_state[str(u_id)] = strategy_payload
+
+        runtime_state = {
+            "schema_version": 1,
+            "episodes_done": int(self.episodes_done),
+            "eval_episodes_done": int(self.eval_episodes_done),
+            "max_eval": dict(self.max_eval),
+            "all_eval": dict(self.rl_eval),
+            "avg_all_eval": list(self.avg_rewards),
+            "per_strategy_state": strategy_state,
+        }
+
+        if hasattr(self, "rl_algorithm") and hasattr(
+            self.rl_algorithm, "export_runtime_state"
+        ):
+            runtime_state["algorithm_runtime_state"] = (
+                self.rl_algorithm.export_runtime_state()
+            )
+
+        return runtime_state
+
+    def import_runtime_state(self, runtime_state: dict) -> None:
+        """Import mutable runtime state from a crash-resume checkpoint."""
+        if not runtime_state:
+            return
+
+        self.episodes_done = int(runtime_state.get("episodes_done", self.episodes_done))
+        self.eval_episodes_done = int(
+            runtime_state.get("eval_episodes_done", self.eval_episodes_done)
+        )
+
+        loaded_max_eval = runtime_state.get("max_eval", {})
+        self.max_eval = defaultdict(lambda: -1e9)
+        for key, value in loaded_max_eval.items():
+            self.max_eval[key] = value
+
+        loaded_eval = runtime_state.get("all_eval", {})
+        self.rl_eval = defaultdict(list)
+        for key, value in loaded_eval.items():
+            self.rl_eval[key] = list(value)
+
+        self.avg_rewards = list(runtime_state.get("avg_all_eval", self.avg_rewards))
+
+        per_strategy_state = runtime_state.get("per_strategy_state", {})
+        for u_id, strategy in self.rl_strats.items():
+            state_for_u = per_strategy_state.get(str(u_id))
+            if not state_for_u:
+                continue
+
+            if hasattr(strategy, "collect_initial_experience_mode"):
+                strategy.collect_initial_experience_mode = bool(
+                    state_for_u.get(
+                        "collect_initial_experience_mode",
+                        strategy.collect_initial_experience_mode,
+                    )
+                )
+
+            action_noise = getattr(strategy, "action_noise", None)
+            if (
+                action_noise is not None
+                and hasattr(action_noise, "dt")
+                and "action_noise_dt" in state_for_u
+            ):
+                action_noise.dt = float(state_for_u["action_noise_dt"])
+
+        algorithm_state = runtime_state.get("algorithm_runtime_state")
+        if (
+            algorithm_state is not None
+            and hasattr(self, "rl_algorithm")
+            and hasattr(self.rl_algorithm, "load_runtime_state")
+        ):
+            self.rl_algorithm.load_runtime_state(algorithm_state)
+
+    def save_runtime_state(self, path: str) -> None:
+        """Persist runtime learning state to disk via atomic file replacement."""
+        dirpath = os.path.dirname(path)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+
+        payload = self.export_runtime_state()
+        tmp_path = f"{path}.tmp"
+        th.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+
+    def load_runtime_state(self, path: str) -> None:
+        """Load runtime learning state from disk and apply it in-place."""
+        payload = th.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid runtime state in {path}: expected dict")
+        self.import_runtime_state(payload)
 
     def turn_off_initial_exploration(self, loaded_only=False) -> None:
         """

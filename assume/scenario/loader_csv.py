@@ -1721,11 +1721,6 @@ def run_learning(
     continue_learning = world.learning_role.learning_config.continue_learning
     confirm_learning_save_path(save_path, continue_learning)
 
-    # also remove tensorboard logs
-    tensorboard_path = f"tensorboard/{world.scenario_data['simulation_id']}"
-    if os.path.exists(tensorboard_path):
-        shutil.rmtree(tensorboard_path, ignore_errors=True)
-
     # -----------------------------------------
     # Information that needs to be stored across episodes, aka one simulation run
     # Read optional replay-buffer persistence settings from learning_config
@@ -1734,18 +1729,49 @@ def run_learning(
     cfg_save_path = getattr(lc, "replay_buffer_save_path", None)
     cfg_load_flag = getattr(lc, "load_replay_buffer", False)
     cfg_load_path = getattr(lc, "replay_buffer_load_path", None)
+    cfg_state_save_flag = getattr(lc, "save_learning_state", True)
+    cfg_state_save_path = getattr(lc, "learning_state_save_path", None)
+    cfg_state_load_flag = getattr(lc, "load_learning_state", False)
+    cfg_state_load_path = getattr(lc, "learning_state_load_path", None)
 
     # default path next to saved policies
     default_buffer_path = f"{save_path}/last_policies/replay_buffer.npz"
+    default_state_path = f"{save_path}/last_policies/learning_state.pt"
+
+    def resolve_checkpoint_path(
+        load_path: str | None,
+        save_path: str | None,
+        default_path: str,
+    ) -> str:
+        """Resolve checkpoint path with precedence: explicit load > explicit save > default."""
+        if load_path is not None:
+            return load_path
+        if save_path is not None:
+            return save_path
+        return default_path
+
+    # keep tensorboard history when we resume from any persisted state
+    resume_mode = continue_learning or cfg_load_flag or cfg_state_load_flag
+    if resume_mode:
+        logger.info(
+            "Resume mode activated (single-world): "
+            f"continue_learning={continue_learning}, "
+            f"load_replay_buffer={cfg_load_flag}, "
+            f"load_learning_state={cfg_state_load_flag}"
+        )
+    if not resume_mode:
+        tensorboard_path = f"tensorboard/{world.scenario_data['simulation_id']}"
+        if os.path.exists(tensorboard_path):
+            shutil.rmtree(tensorboard_path, ignore_errors=True)
 
     buffer = None
     # Load only when explicitly requested via load_replay_buffer
     if cfg_load_flag:
         # choose explicit load path if provided, otherwise fall back to configured save path or default
-        path_to_load = (
-            cfg_load_path
-            if cfg_load_path is not None
-            else (cfg_save_path if cfg_save_path is not None else default_buffer_path)
+        path_to_load = resolve_checkpoint_path(
+            load_path=cfg_load_path,
+            save_path=cfg_save_path,
+            default_path=default_buffer_path,
         )
         if not os.path.exists(path_to_load):
             raise AssumeException(
@@ -1795,6 +1821,29 @@ def run_learning(
 
     world.learning_role.load_inter_episodic_data(inter_episodic_data)
 
+    if cfg_state_load_flag:
+        state_path_to_load = resolve_checkpoint_path(
+            load_path=cfg_state_load_path,
+            save_path=cfg_state_save_path,
+            default_path=default_state_path,
+        )
+        if not os.path.exists(state_path_to_load):
+            raise AssumeException(
+                "load_learning_state is true but no learning-state file found at "
+                f"{state_path_to_load}"
+            )
+        try:
+            world.learning_role.load_runtime_state(state_path_to_load)
+            logger.info(f"Loaded learning runtime state from {state_path_to_load}")
+        except Exception as e:
+            raise AssumeException(
+                f"Failed to load learning runtime state from {state_path_to_load}: {e}"
+            )
+
+    inter_episodic_data = world.learning_role.get_inter_episodic_data()
+    start_episode = max(int(inter_episodic_data.get("episodes_done", 0)) + 1, 1)
+    eval_episode = int(inter_episodic_data.get("eval_episodes_done", 0)) + 1
+
     validation_interval = world.learning_role.determine_validation_interval()
 
     # sync train frequency with simulation horizon once at the beginning of training and overwrite scenario data
@@ -1802,15 +1851,32 @@ def run_learning(
         world.learning_role.sync_train_freq_with_simulation_horizon()
     )
 
-    eval_episode = 1
+    if start_episode > world.learning_role.learning_config.training_episodes:
+        logger.info(
+            "Training already complete according to loaded runtime state "
+            f"(episodes_done={start_episode - 1}). Skipping training loop."
+        )
+
+    if (
+        start_episode != 1
+        and start_episode <= world.learning_role.learning_config.training_episodes
+    ):
+        setup_world(
+            world=world,
+            episode=start_episode,
+        )
+        world.learning_role.load_inter_episodic_data(inter_episodic_data)
 
     for episode in tqdm(
-        range(1, world.learning_role.learning_config.training_episodes + 1),
+        range(
+            start_episode,
+            world.learning_role.learning_config.training_episodes + 1,
+        ),
         desc="Training Episodes",
     ):
         # -----------------------------------------
         # Give the newly initialized learning role the needed information across episodes
-        if episode != 1:
+        if episode != start_episode:
             setup_world(
                 world=world,
                 episode=episode,
@@ -1907,6 +1973,18 @@ def run_learning(
                             )
             except Exception:
                 logger.warning("Failed to save replay buffer")
+
+            try:
+                if cfg_state_save_flag:
+                    state_save_path = (
+                        cfg_state_save_path
+                        if cfg_state_save_path is not None
+                        else default_state_path
+                    )
+                    world.learning_role.save_runtime_state(state_save_path)
+                    logger.info(f"Learning runtime state saved: {state_save_path}")
+            except Exception:
+                logger.warning("Failed to save learning runtime state")
 
     # container shutdown implicitly with new initialisation
     logger.info("################")

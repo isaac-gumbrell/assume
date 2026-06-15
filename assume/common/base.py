@@ -830,6 +830,16 @@ class LearningConfig:
             critic updates. This smoothing helps prevent overfitting to narrow policy peaks. Default is 0.2.
         target_noise_clip (float): The maximum absolute value for clipping the target policy noise.
             Prevents the noise from being too large. Default is 0.5.
+        save_learning_state (bool): Whether to persist mutable training state (episode counters, eval history,
+            algorithm runtime state, and per-strategy dynamic exploration state) to disk.
+            Default is True.
+        learning_state_save_path (str | None): Optional explicit file path used when saving learning state.
+            If None, defaults to <trained_policies_save_path>/last_policies/learning_state.pt.
+        load_learning_state (bool): Whether to load learning state from disk and resume episode/evaluation counters.
+            Default is False.
+        learning_state_load_path (str | None): Optional explicit file path used when loading learning state.
+            If None, defaults to learning_state_save_path if provided, otherwise
+            <trained_policies_save_path>/last_policies/learning_state.pt.
 
     """
 
@@ -872,6 +882,10 @@ class LearningConfig:
     replay_buffer_save_path: str | None = None
     load_replay_buffer: bool = False
     replay_buffer_load_path: str | None = None
+    save_learning_state: bool = True
+    learning_state_save_path: str | None = None
+    load_learning_state: bool = False
+    learning_state_load_path: str | None = None
 
     # Optional staggered (paired-scenario) training config — see D3 spec.
     # Expected shape:

@@ -37,6 +37,7 @@ class TD3(RLAlgorithm):
 
         self.n_updates = 0
         self.grad_clip_norm = 1.0
+        self.current_learning_rate = None
 
     def save_params(self, directory):
         """
@@ -48,6 +49,29 @@ class TD3(RLAlgorithm):
         """
         self.save_critic_params(directory=f"{directory}/critics")
         self.save_actor_params(directory=f"{directory}/actors")
+
+    def export_runtime_state(self) -> dict:
+        """Export mutable algorithm runtime state for crash-resume."""
+        return {
+            "n_updates": int(self.n_updates),
+            "current_learning_rate": self.current_learning_rate,
+        }
+
+    def load_runtime_state(self, runtime_state: dict) -> None:
+        """Import mutable algorithm runtime state for crash-resume."""
+        if not runtime_state:
+            return
+        self.n_updates = int(runtime_state.get("n_updates", self.n_updates))
+        self.current_learning_rate = runtime_state.get(
+            "current_learning_rate", self.current_learning_rate
+        )
+
+        if self.current_learning_rate is not None:
+            for strategy in self.learning_role.rl_strats.values():
+                self.update_learning_rate(
+                    [strategy.critics.optimizer, strategy.actor.optimizer],
+                    learning_rate=float(self.current_learning_rate),
+                )
 
     def save_critic_params(self, directory):
         """
@@ -486,6 +510,7 @@ class TD3(RLAlgorithm):
         learning_rate = self.learning_role.calc_lr_from_progress(
             self.learning_role.get_progress_remaining()
         )
+        self.current_learning_rate = float(learning_rate)
 
         # loop over all units to avoid update call for every gradient step, as it will be ambiguous
         for strategy in strategies:

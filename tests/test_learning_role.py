@@ -70,6 +70,87 @@ def test_learning_init():
     assert ac["critics"]["test_id"] == learn.rl_strats["test_id"].critics
 
 
+@pytest.mark.require_learning
+def test_learning_runtime_state_roundtrip(tmp_path):
+    class DummyNoise:
+        def __init__(self, dt):
+            self.dt = dt
+
+    config = {
+        "foresight": 1,
+        "act_dim": 2,
+        "unique_obs_dim": 0,
+        "learning_config": LearningConfig(
+            train_freq="1h",
+            algorithm="matd3",
+            actor_architecture="mlp",
+            learning_mode=True,
+            evaluation_mode=False,
+            training_episodes=10,
+            episodes_collecting_initial_experience=1,
+            continue_learning=False,
+            trained_policies_save_path=None,
+            early_stopping_steps=10,
+            early_stopping_threshold=0.05,
+        ),
+    }
+
+    learn = Learning(config["learning_config"], start=start, end=end)
+    learn.rl_strats["test_id"] = LearningStrategy(**config, learning_role=learn)
+    learn.initialize_policy()
+
+    learn.episodes_done = 7
+    learn.eval_episodes_done = 2
+    learn.max_eval["avg_reward"] = 1.23
+    learn.rl_eval["avg_reward"] = [0.5, 1.23]
+    learn.avg_rewards = [0.7, 0.8]
+    learn.rl_algorithm.n_updates = 42
+    learn.rl_algorithm.current_learning_rate = 0.000123
+    learn.rl_algorithm.update_learning_rate(
+        [
+            learn.rl_strats["test_id"].actor.optimizer,
+            learn.rl_strats["test_id"].critics.optimizer,
+        ],
+        learning_rate=learn.rl_algorithm.current_learning_rate,
+    )
+    learn.rl_strats["test_id"].collect_initial_experience_mode = False
+    learn.rl_strats["test_id"].action_noise = DummyNoise(dt=0.321)
+
+    state_path = tmp_path / "learning_state.pt"
+    learn.save_runtime_state(str(state_path))
+
+    resumed = Learning(config["learning_config"], start=start, end=end)
+    resumed.rl_strats["test_id"] = LearningStrategy(**config, learning_role=resumed)
+    resumed.rl_strats["test_id"].collect_initial_experience_mode = True
+    resumed.rl_strats["test_id"].action_noise = DummyNoise(dt=0.999)
+    resumed.initialize_policy()
+    resumed.rl_algorithm.current_learning_rate = 0.009
+    resumed.rl_algorithm.update_learning_rate(
+        [
+            resumed.rl_strats["test_id"].actor.optimizer,
+            resumed.rl_strats["test_id"].critics.optimizer,
+        ],
+        learning_rate=resumed.rl_algorithm.current_learning_rate,
+    )
+    resumed.load_runtime_state(str(state_path))
+
+    assert resumed.episodes_done == 7
+    assert resumed.eval_episodes_done == 2
+    assert resumed.max_eval["avg_reward"] == pytest.approx(1.23)
+    assert resumed.rl_eval["avg_reward"] == [0.5, 1.23]
+    assert resumed.avg_rewards == [0.7, 0.8]
+    assert resumed.rl_algorithm.n_updates == 42
+    assert resumed.rl_algorithm.current_learning_rate == pytest.approx(0.000123)
+    assert resumed.rl_strats["test_id"].actor.optimizer.param_groups[0][
+        "lr"
+    ] == pytest.approx(0.000123)
+    assert resumed.rl_strats["test_id"].critics.optimizer.param_groups[0][
+        "lr"
+    ] == pytest.approx(0.000123)
+    assert resumed.rl_strats["test_id"].collect_initial_experience_mode is False
+    assert resumed.rl_strats["test_id"].action_noise.dt == pytest.approx(0.321)
+
+
 @pytest.fixture
 async def learning_role():
     """Fixture that provides a learning role configuration for atomic swap tests."""

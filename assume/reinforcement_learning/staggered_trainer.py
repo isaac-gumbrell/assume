@@ -180,22 +180,81 @@ class StaggeredTrainer:
         continue_learning = learning_config.continue_learning
         confirm_learning_save_path(save_path, continue_learning)
 
-        # Reset tensorboard logs for both worlds' simulation_ids.
-        for w in self.worlds:
-            tb_path = f"tensorboard/{w.scenario_data['simulation_id']}"
-            if os.path.exists(tb_path):
-                shutil.rmtree(tb_path, ignore_errors=True)
+        cfg_save_flag = getattr(learning_config, "save_replay_buffer", True)
+        cfg_save_path = getattr(learning_config, "replay_buffer_save_path", None)
+        cfg_load_flag = getattr(learning_config, "load_replay_buffer", False)
+        cfg_load_path = getattr(learning_config, "replay_buffer_load_path", None)
+        cfg_state_save_flag = getattr(learning_config, "save_learning_state", True)
+        cfg_state_save_path = getattr(learning_config, "learning_state_save_path", None)
+        cfg_state_load_flag = getattr(learning_config, "load_learning_state", False)
+        cfg_state_load_path = getattr(learning_config, "learning_state_load_path", None)
+
+        default_buffer_path = f"{save_path}/last_policies/replay_buffer.npz"
+        default_state_path = f"{save_path}/last_policies/learning_state.pt"
+
+        def resolve_checkpoint_path(
+            load_path: str | None,
+            save_path: str | None,
+            default_path: str,
+        ) -> str:
+            """Resolve checkpoint path with precedence: explicit load > explicit save > default."""
+            if load_path is not None:
+                return load_path
+            if save_path is not None:
+                return save_path
+            return default_path
+
+        resume_mode = continue_learning or cfg_load_flag or cfg_state_load_flag
+        if resume_mode:
+            logger.info(
+                "Resume mode activated (staggered): "
+                f"continue_learning={continue_learning}, "
+                f"load_replay_buffer={cfg_load_flag}, "
+                f"load_learning_state={cfg_state_load_flag}"
+            )
+
+        # Reset tensorboard logs for fresh starts only.
+        if not resume_mode:
+            for w in self.worlds:
+                tb_path = f"tensorboard/{w.scenario_data['simulation_id']}"
+                if os.path.exists(tb_path):
+                    shutil.rmtree(tb_path, ignore_errors=True)
 
         # Single shared inter-episodic state (buffer / actors / max_eval).
-        inter_episodic_data = {
-            "buffer": ReplayBuffer(
+        if cfg_load_flag:
+            path_to_load = resolve_checkpoint_path(
+                load_path=cfg_load_path,
+                save_path=cfg_save_path,
+                default_path=default_buffer_path,
+            )
+            if not os.path.exists(path_to_load):
+                raise AssumeException(
+                    f"load_replay_buffer is true but no buffer file found at {path_to_load}"
+                )
+            buffer = ReplayBuffer.load(
+                path_to_load,
+                device=self.anchor.learning_role.device,
+                float_type=self.anchor.learning_role.float_type,
+            )
+            logger.info(f"Loaded replay buffer from {path_to_load}")
+            try:
+                self.anchor.learning_role.learning_config.episodes_collecting_initial_experience = 0
+            except Exception:
+                logger.warning(
+                    "Could not set episodes_collecting_initial_experience to 0 on learning_config"
+                )
+        else:
+            buffer = ReplayBuffer(
                 buffer_size=learning_config.replay_buffer_size,
                 obs_dim=self.anchor.learning_role.rl_algorithm.obs_dim,
                 act_dim=self.anchor.learning_role.rl_algorithm.act_dim,
                 n_rl_units=len(self.anchor.learning_role.rl_strats),
                 device=self.anchor.learning_role.device,
                 float_type=self.anchor.learning_role.float_type,
-            ),
+            )
+
+        inter_episodic_data = {
+            "buffer": buffer,
             "actors_and_critics": None,
             "max_eval": defaultdict(lambda: -1e9),
             "all_eval": defaultdict(list),
@@ -207,6 +266,24 @@ class StaggeredTrainer:
             w.learning_role.load_inter_episodic_data(inter_episodic_data)
         # share buffer reference once it exists
         self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+
+        if cfg_state_load_flag:
+            state_path_to_load = resolve_checkpoint_path(
+                load_path=cfg_state_load_path,
+                save_path=cfg_state_save_path,
+                default_path=default_state_path,
+            )
+            if not os.path.exists(state_path_to_load):
+                raise AssumeException(
+                    "load_learning_state is true but no learning-state file found at "
+                    f"{state_path_to_load}"
+                )
+            self.anchor.learning_role.load_runtime_state(state_path_to_load)
+            logger.info(f"Loaded learning runtime state from {state_path_to_load}")
+
+        inter_episodic_data = self.anchor.learning_role.get_inter_episodic_data()
+        start_episode = max(int(inter_episodic_data.get("episodes_done", 0)) + 1, 1)
+        eval_episode = int(inter_episodic_data.get("eval_episodes_done", 0)) + 1
 
         validation_interval = self.anchor.learning_role.determine_validation_interval()
 
@@ -222,12 +299,25 @@ class StaggeredTrainer:
                 )
                 w.learning_role.learning_config.train_freq = new_train_freq
 
-        eval_episode = 1
+        if start_episode > learning_config.training_episodes:
+            logger.info(
+                "Training already complete according to loaded runtime state "
+                f"(episodes_done={start_episode - 1}). Skipping training loop."
+            )
+
+        if start_episode != 1 and start_episode <= learning_config.training_episodes:
+            for w in self.worlds:
+                setup_world(world=w, episode=start_episode)
+            _share_learning_state(self.anchor, self.secondary)
+            for w in self.worlds:
+                w.learning_role.load_inter_episodic_data(inter_episodic_data)
+            self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+
         for episode in tqdm(
-            range(1, learning_config.training_episodes + 1),
+            range(start_episode, learning_config.training_episodes + 1),
             desc="Staggered Training Episodes",
         ):
-            if episode != 1:
+            if episode != start_episode:
                 for w in self.worlds:
                     setup_world(world=w, episode=episode)
                 _share_learning_state(self.anchor, self.secondary)
@@ -308,14 +398,22 @@ class StaggeredTrainer:
                 self.anchor.learning_role.rl_algorithm.save_params(
                     directory=f"{learning_config.trained_policies_save_path}/last_policies"
                 )
-                lc = self.anchor.learning_role.learning_config
-                if getattr(lc, "save_replay_buffer", True):
+                if cfg_save_flag:
                     buf = self.anchor.learning_role.buffer
                     if buf is not None:
-                        buf_path = getattr(lc, "replay_buffer_save_path", None) or (
-                            f"{lc.trained_policies_save_path}/last_policies/replay_buffer.npz"
+                        buf_path = (
+                            cfg_save_path
+                            if cfg_save_path is not None
+                            else default_buffer_path
                         )
                         buf.save(buf_path)
+                if cfg_state_save_flag:
+                    state_save_path = (
+                        cfg_state_save_path
+                        if cfg_state_save_path is not None
+                        else default_state_path
+                    )
+                    self.anchor.learning_role.save_runtime_state(state_save_path)
 
         logger.info("################")
         logger.info("Staggered training finished, starting evaluation run")
