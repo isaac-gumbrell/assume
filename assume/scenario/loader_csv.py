@@ -1551,6 +1551,13 @@ def load_staggered_scenario(
         )
         line_id_sets.append(_collect_market_line_ids(world))
 
+    simulation_ids = [str(w.scenario_data.get("simulation_id", "")) for w in worlds]
+    if any(not sid for sid in simulation_ids) or len(set(simulation_ids)) != 2:
+        raise ValueError(
+            "Staggered training requires two distinct non-empty simulation_id values; "
+            f"got {simulation_ids}."
+        )
+
     # G2 — registered RL units must match across both worlds.
     if rl_unit_id_sets[0] != rl_unit_id_sets[1]:
         only_a = rl_unit_id_sets[0] - rl_unit_id_sets[1]

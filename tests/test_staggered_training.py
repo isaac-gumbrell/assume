@@ -38,6 +38,7 @@ from assume.reinforcement_learning.staggered_trainer import (
 from assume.scenario.loader_csv import (
     build_staggered_supersets,
     load_config_and_create_forecaster,
+    load_staggered_scenario,
     run_learning,
 )
 
@@ -480,6 +481,187 @@ def test_staggered_trainer_resume_skips_training_and_keeps_tensorboard(
 
     assert marker_a.exists(), "Anchor TensorBoard directory should be preserved"
     assert marker_b.exists(), "Secondary TensorBoard directory should be preserved"
+
+
+@pytest.mark.require_learning
+def test_staggered_trainer_updates_tensorboard_for_both_worlds(tmp_path, monkeypatch):
+    """After each staggered training episode, both worlds' TensorBoard loggers
+    must be refreshed so each simulation_id produces visible scalar series.
+    """
+
+    class CountingLogger:
+        def __init__(self):
+            self.calls = 0
+
+        def update_tensorboard(self):
+            self.calls += 1
+
+    class FakeLearningRole:
+        def __init__(self, learning_config):
+            self.learning_config = learning_config
+            self.rl_algorithm = SimpleNamespace(
+                initialize_policy=lambda: None,
+                obs_dim=1,
+                act_dim=1,
+                save_params=lambda **_: None,
+            )
+            self.rl_strats = {"u1": SimpleNamespace()}
+            self.device = "cpu"
+            self.float_type = None
+            self.buffer = None
+            self.episodes_done = 0
+            self.eval_episodes_done = 0
+            self.tensor_board_logger = CountingLogger()
+
+        def load_inter_episodic_data(self, data):
+            self.buffer = data["buffer"]
+
+        def determine_validation_interval(self):
+            return 1
+
+        def sync_train_freq_with_simulation_horizon(self):
+            return "1h"
+
+        def get_inter_episodic_data(self):
+            return {
+                "buffer": self.buffer,
+                "actors_and_critics": None,
+                "max_eval": {},
+                "all_eval": {},
+                "avg_all_eval": [],
+                "episodes_done": self.episodes_done,
+                "eval_episodes_done": self.eval_episodes_done,
+            }
+
+        def save_runtime_state(self, path):
+            pass
+
+    lc = LearningConfig(
+        learning_mode=True,
+        training_episodes=1,
+        episodes_collecting_initial_experience=99,
+        train_freq="1h",
+        trained_policies_save_path=str(tmp_path / "learned"),
+    )
+
+    shared_loop = asyncio.new_event_loop()
+    world_a = SimpleNamespace(
+        scenario_data={"simulation_id": "sim_a", "config": {"learning_config": {}}},
+        simulation_id="sim_a",
+        learning_role=FakeLearningRole(lc),
+        export_csv_path="",
+        reset=lambda: None,
+        loop=shared_loop,
+    )
+    world_b = SimpleNamespace(
+        scenario_data={"simulation_id": "sim_b", "config": {"learning_config": {}}},
+        simulation_id="sim_b",
+        learning_role=FakeLearningRole(lc),
+        export_csv_path="",
+        reset=lambda: None,
+        loop=shared_loop,
+    )
+
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer._share_learning_state",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer._ensure_persistent_loop",
+        lambda worlds: worlds[0].loop,
+    )
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer.confirm_learning_save_path",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        "assume.reinforcement_learning.staggered_trainer.StaggeredTrainer._run_episode_chunked",
+        lambda *_, **__: None,
+    )
+    monkeypatch.setattr("assume.scenario.loader_csv.setup_world", lambda **_: None)
+
+    try:
+        trainer = StaggeredTrainer([world_a, world_b], verbose=False)
+        trainer.run()
+    finally:
+        shared_loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    assert world_a.learning_role.tensor_board_logger.calls == 1
+    assert world_b.learning_role.tensor_board_logger.calls == 1
+
+
+def test_load_staggered_scenario_rejects_duplicate_simulation_ids(
+    tmp_path, monkeypatch
+):
+    """Staggered loader must fail fast when both worlds resolve to the same
+    simulation_id to prevent TensorBoard/DB namespace collisions.
+    """
+
+    primary = tmp_path / "primary"
+    scenario_a = tmp_path / "scenario_a"
+    scenario_b = tmp_path / "scenario_b"
+    primary.mkdir(parents=True, exist_ok=True)
+    scenario_a.mkdir(parents=True, exist_ok=True)
+    scenario_b.mkdir(parents=True, exist_ok=True)
+
+    primary.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "case:",
+                "  learning_config:",
+                "    staggered_training:",
+                "      enabled: true",
+                "      scenarios:",
+                "        - path: ../scenario_a",
+                "          name: bau",
+                "        - path: ../scenario_a",
+                "          name: inv",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scenario_a.joinpath("config.yaml").write_text("case: {}\n", encoding="utf-8")
+    scenario_b.joinpath("config.yaml").write_text("case: {}\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "assume.scenario.loader_csv._check_staggered_input_file_parity",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        "assume.scenario.loader_csv.build_staggered_supersets",
+        lambda paths: ([], {p: {} for p in paths}),
+    )
+    monkeypatch.setattr(
+        "assume.scenario.loader_csv.load_config_and_create_forecaster",
+        lambda *_, **__: {
+            "simulation_id": "same_simulation_id",
+            "config": {"learning_config": {}},
+        },
+    )
+
+    def _fake_setup_world(world, **_):
+        world.learning_role = SimpleNamespace(rl_strats={})
+        world.markets = {}
+
+    monkeypatch.setattr("assume.scenario.loader_csv.setup_world", _fake_setup_world)
+
+    loop = asyncio.new_event_loop()
+    worlds = [
+        SimpleNamespace(loop=loop, scenario_data={}, markets={}),
+        SimpleNamespace(loop=loop, scenario_data={}, markets={}),
+    ]
+
+    try:
+        with pytest.raises(ValueError, match="distinct non-empty simulation_id"):
+            load_staggered_scenario(
+                worlds=worlds,
+                inputs_path=str(tmp_path),
+                scenario="primary",
+                study_case="case",
+            )
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------

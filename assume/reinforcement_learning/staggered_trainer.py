@@ -331,7 +331,12 @@ class StaggeredTrainer:
             )
 
             # Aggregate inter-episodic data from anchor (it's the shared owner).
-            self.anchor.learning_role.tensor_board_logger.update_tensorboard()
+            for w in self.worlds:
+                tb_logger = getattr(
+                    getattr(w, "learning_role", None), "tensor_board_logger", None
+                )
+                if tb_logger is not None:
+                    tb_logger.update_tensorboard()
             inter_episodic_data = self.anchor.learning_role.get_inter_episodic_data()
             inter_episodic_data["episodes_done"] = episode
 
@@ -361,7 +366,12 @@ class StaggeredTrainer:
                     eval_order,
                     train_freq=new_train_freq or learning_config.train_freq,
                 )
-                self.anchor.learning_role.tensor_board_logger.update_tensorboard()
+                for w in self.worlds:
+                    tb_logger = getattr(
+                        getattr(w, "learning_role", None), "tensor_board_logger", None
+                    )
+                    if tb_logger is not None:
+                        tb_logger.update_tensorboard()
 
                 per_scenario_avg = {}
                 for w in self.worlds:

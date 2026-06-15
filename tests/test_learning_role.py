@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -149,6 +150,73 @@ def test_learning_runtime_state_roundtrip(tmp_path):
     ] == pytest.approx(0.000123)
     assert resumed.rl_strats["test_id"].collect_initial_experience_mode is False
     assert resumed.rl_strats["test_id"].action_noise.dt == pytest.approx(0.321)
+
+
+@pytest.mark.require_learning
+def test_write_rl_grad_params_uses_global_update_counter():
+    """Gradient-step logging must follow TD3.n_updates to avoid collisions in
+    staggered mode where update_policy can run more than once per chunk.
+    """
+    config = {
+        "foresight": 1,
+        "act_dim": 2,
+        "unique_obs_dim": 0,
+        "learning_config": LearningConfig(
+            train_freq="1h",
+            algorithm="matd3",
+            actor_architecture="mlp",
+            learning_mode=True,
+            evaluation_mode=False,
+            training_episodes=3,
+            episodes_collecting_initial_experience=1,
+            continue_learning=False,
+            trained_policies_save_path=None,
+            early_stopping_steps=10,
+            early_stopping_threshold=0.05,
+            gradient_steps=2,
+        ),
+    }
+
+    learn = Learning(config["learning_config"], start=start, end=end)
+    learn.db_addr = "db"
+    learn._context = MagicMock()
+
+    # Simulate having completed three update_policy calls in the past (2 steps each),
+    # and currently logging the 4th call. During this write, n_updates already includes
+    # the current call's steps.
+    learn.rl_algorithm = SimpleNamespace(n_updates=8)
+    learn.update_steps = 999
+
+    unit_params = [
+        {
+            "unit_1": {
+                "actor_loss": 1.0,
+                "actor_total_grad_norm": 1.0,
+                "actor_max_grad_norm": 1.0,
+                "critic_loss": 2.0,
+                "critic_total_grad_norm": 2.0,
+                "critic_max_grad_norm": 2.0,
+            }
+        },
+        {
+            "unit_1": {
+                "actor_loss": 1.1,
+                "actor_total_grad_norm": 1.1,
+                "actor_max_grad_norm": 1.1,
+                "critic_loss": 2.1,
+                "critic_total_grad_norm": 2.1,
+                "critic_max_grad_norm": 2.1,
+            }
+        },
+    ]
+
+    learn.write_rl_grad_params_to_output(
+        learning_rate=0.01, unit_params_list=unit_params
+    )
+
+    call_kwargs = learn.context.schedule_instant_message.call_args.kwargs
+    rows = call_kwargs["content"]["data"]
+    assert [row["step"] for row in rows] == [6, 7]
 
 
 @pytest.fixture

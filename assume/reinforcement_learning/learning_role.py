@@ -808,26 +808,35 @@ class Learning(Role):
             A list of dictionaries containing critic losses for each time step.
             Each dictionary maps critic names to their corresponding loss values.
         """
-        # gradient steps performed in previous training episodes
-        gradient_steps_done = (
-            max(
-                self.episodes_done
-                - self.learning_config.episodes_collecting_initial_experience,
+        # Use the algorithm runtime counter as the source of truth. This avoids
+        # collisions in staggered training where update_policy() can be called
+        # more than once per train_freq chunk.
+        gradient_steps_done: int
+        n_updates = getattr(getattr(self, "rl_algorithm", None), "n_updates", None)
+        if n_updates is not None:
+            gradient_steps_done = max(
+                int(n_updates) - int(self.learning_config.gradient_steps),
                 0,
             )
-            * int(
-                (timestamp2datetime(self.end) - timestamp2datetime(self.start))
-                / pd.Timedelta(self.learning_config.train_freq)
+        else:
+            # Fallback for compatibility with algorithms that do not expose
+            # a global update counter.
+            gradient_steps_done = (
+                max(
+                    self.episodes_done
+                    - self.learning_config.episodes_collecting_initial_experience,
+                    0,
+                )
+                * int(
+                    (timestamp2datetime(self.end) - timestamp2datetime(self.start))
+                    / pd.Timedelta(self.learning_config.train_freq)
+                )
+                * self.learning_config.gradient_steps
             )
-            * self.learning_config.gradient_steps
-        )
 
         output_list = [
             {
-                "step": gradient_steps_done
-                + self.update_steps
-                * self.learning_config.gradient_steps  # gradient steps performed in current training episode
-                + gradient_step,
+                "step": gradient_steps_done + gradient_step,
                 "unit": u_id,
                 "actor_loss": params["actor_loss"],
                 "actor_total_grad_norm": params["actor_total_grad_norm"],
