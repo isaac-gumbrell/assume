@@ -1,0 +1,38 @@
+mode: batch  # single | batch
+
+inputs_path: "inputs"
+db_uri: "postgresql://assume:assume@172.22.26.171:5432/assume?sslmode=disable&gssencmode=disable"
+
+# ── mode: single ──────────────────────────────────────────────────────────
+scenario: "srmc_INVEST_FG_Optgen_AE_CF_r17b_tr01_2030" #"profit_invest_2045_test" #"lt4"
+study_case: "run"
+
+# ── mode: batch ───────────────────────────────────────────────────────────
+# Staggered cases (learning_config.staggered_training.enabled: true) are
+# automatically detected per-case and dispatched to run_staggered_learning.
+# Mix regular and staggered scenarios freely in the same list.
+scenarios:
+  - yr_profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030
+  # - yr_profit_INVEST_FG_Optgen_AE_CF_r17b_tr01_2030
+  # - yr_srmc_BAU_FG_Optgen_AE_CF_r17b_tr01_2030
+  # - "profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030"
+  # - "profit_INVEST_FG_Optgen_AE_CF_r17b_tr01_2030"
+
+cases: []        # empty list = all cases from each scenario's config.yaml
+workers: null    # null = o ne worker per task
+
+# ── shared optional settings ──────────────────────────────────────────────
+log_dir: "logs"
+monitor: true
+monitor_interval: 5   # seconds between dashboard refreshes
+dry_run: false
+force_no_learning: false  # true = disable RL training for all cases (run with fixed/SRMC policies)
+policy_base_scenario: null # yr_profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030
+# re-root trained_policies_load_path to a different scenario folder
+# e.g. "profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030" loads policies
+# trained there and evaluates them against the current scenario
+
+# ── advanced / worker settings ────────────────────────────────────────────
+worker_start_delay: 2   # seconds between spawning each worker (reduces memory spike)
+threads_per_process: 1  # torch intra-op threads per worker
+interop_threads: 1      # torch inter-op threads per worker
