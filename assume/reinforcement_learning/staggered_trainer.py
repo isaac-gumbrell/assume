@@ -80,7 +80,18 @@ def _share_learning_state(anchor: World, secondary: World) -> None:
     # Initialize the anchor's policy first so actor/critic objects exist.
     if getattr(anchor_role, "rl_algorithm", None) is None:
         return
-    anchor_role.rl_algorithm.initialize_policy()
+
+    # Avoid unconditionally re-initializing the policy here. If the
+    # anchor's strategies already have `actor` objects (for example when
+    # policies were loaded by `load_inter_episodic_data`), calling
+    # `initialize_policy()` would recreate networks and wipe loaded params.
+    needs_init = False
+    for strategy in anchor_role.rl_strats.values():
+        if not hasattr(strategy, "actor") or getattr(strategy, "actor") is None:
+            needs_init = True
+            break
+    if needs_init:
+        anchor_role.rl_algorithm.initialize_policy()
 
     # Share the algorithm instance — same actor / critic / optimisers.
     secondary_role.rl_algorithm = anchor_role.rl_algorithm
@@ -238,7 +249,11 @@ class StaggeredTrainer:
             )
             logger.info(f"Loaded replay buffer from {path_to_load}")
             try:
-                self.anchor.learning_role.learning_config.episodes_collecting_initial_experience = 0
+                for w in self.worlds:
+                    w.learning_role.learning_config.episodes_collecting_initial_experience = 0
+                    w.scenario_data["config"]["learning_config"][
+                        "episodes_collecting_initial_experience"
+                    ] = 0
             except Exception:
                 logger.warning(
                     "Could not set episodes_collecting_initial_experience to 0 on learning_config"
@@ -262,10 +277,7 @@ class StaggeredTrainer:
             "episodes_done": 0,
             "eval_episodes_done": 0,
         }
-        for w in self.worlds:
-            w.learning_role.load_inter_episodic_data(inter_episodic_data)
-        # share buffer reference once it exists
-        self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+        self._load_and_share_state(inter_episodic_data)
 
         if cfg_state_load_flag:
             state_path_to_load = resolve_checkpoint_path(
@@ -285,6 +297,11 @@ class StaggeredTrainer:
         start_episode = max(int(inter_episodic_data.get("episodes_done", 0)) + 1, 1)
         eval_episode = int(inter_episodic_data.get("eval_episodes_done", 0)) + 1
 
+        # When restarting from episode 1 (no state loaded), existing DB records for
+        # these simulation IDs would corrupt the new TB charts. Clear them now so
+        # the new run writes into a clean slate.
+        if start_episode == 1:
+            self._clear_stale_training_db_data()
         validation_interval = self.anchor.learning_role.determine_validation_interval()
 
         # Sync train_freq with simulation horizon (anchor only — both worlds share
@@ -308,10 +325,7 @@ class StaggeredTrainer:
         if start_episode != 1 and start_episode <= learning_config.training_episodes:
             for w in self.worlds:
                 setup_world(world=w, episode=start_episode)
-            _share_learning_state(self.anchor, self.secondary)
-            for w in self.worlds:
-                w.learning_role.load_inter_episodic_data(inter_episodic_data)
-            self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+            self._load_and_share_state(inter_episodic_data)
 
         for episode in tqdm(
             range(start_episode, learning_config.training_episodes + 1),
@@ -320,10 +334,7 @@ class StaggeredTrainer:
             if episode != start_episode:
                 for w in self.worlds:
                     setup_world(world=w, episode=episode)
-                _share_learning_state(self.anchor, self.secondary)
-                for w in self.worlds:
-                    w.learning_role.load_inter_episodic_data(inter_episodic_data)
-                self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+                self._load_and_share_state(inter_episodic_data)
 
             order = self._world_order(episode)
             self._run_episode_chunked(
@@ -356,10 +367,7 @@ class StaggeredTrainer:
                         episode=episode,
                         eval_episode=eval_episode,
                     )
-                _share_learning_state(self.anchor, self.secondary)
-                for w in self.worlds:
-                    w.learning_role.load_inter_episodic_data(inter_episodic_data)
-                self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+                self._load_and_share_state(inter_episodic_data)
 
                 eval_order = self._world_order(episode)
                 self._run_episode_chunked(
@@ -438,6 +446,81 @@ class StaggeredTrainer:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+    def _load_and_share_state(self, inter_episodic_data: dict) -> None:
+        """Load inter-episodic data into both worlds then re-share learning state.
+
+        The correct order is:
+        1. Load data into both worlds (``load_inter_episodic_data``).
+        2. Re-run ``_share_learning_state`` so that the secondary's strategy
+            actor references are updated to whatever the anchor's
+            ``initialize_policy`` just installed.
+        3. Copy the buffer reference from anchor to secondary.
+        4. Sync ``collect_initial_experience_mode`` so secondary mirrors anchor
+            (important when ``actors_and_critics`` was ``None`` on the first call).
+        """
+        for w in self.worlds:
+            w.learning_role.load_inter_episodic_data(inter_episodic_data)
+        # Re-share AFTER load so secondary gets anchor's up-to-date actor refs.
+        _share_learning_state(self.anchor, self.secondary)
+        self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
+        self._sync_exploration_state()
+
+    def _sync_exploration_state(self) -> None:
+        """Copy ``collect_initial_experience_mode`` from anchor strategies to secondary.
+
+        ``load_inter_episodic_data`` on the secondary may fail to turn off
+        exploration when the actor ``loaded`` flag is stale (set before the
+        latest ``_share_learning_state`` call).  This pass fixes that by
+        mirroring the anchor's already-correct exploration state.
+        """
+        for unit_id, sec_strat in self.secondary.learning_role.rl_strats.items():
+            if unit_id in self.anchor.learning_role.rl_strats:
+                sec_strat.collect_initial_experience_mode = (
+                    self.anchor.learning_role.rl_strats[
+                        unit_id
+                    ].collect_initial_experience_mode
+                )
+
+    def _clear_stale_training_db_data(self) -> None:
+        """Delete old training-mode rl_params / rl_grad_params rows for this run.
+
+        When ``start_episode == 1`` the episode counters reset to 1.  Any rows
+        from a previous run that share the same simulation ID and episode number
+        would be mixed with new data when the TB logger reads from the DB, producing
+        corrupted charts (e.g. inflated critic-loss at gradient-step 1).
+
+        Only training rows (``evaluation_mode = 0``) are removed; evaluation rows
+        are left intact so historical best-policy comparisons still work.
+        """
+        from sqlalchemy import create_engine, text
+
+        for w in self.worlds:
+            if not w.db_uri:
+                continue
+            sim_id = w.simulation_id
+            try:
+                engine = create_engine(w.db_uri)
+                with engine.begin() as conn:
+                    for tbl in ("rl_params", "rl_grad_params"):
+                        try:
+                            conn.execute(
+                                text(
+                                    f"DELETE FROM {tbl} WHERE simulation = :sid"
+                                    " AND evaluation_mode = 0"
+                                ),
+                                {"sid": sim_id},
+                            )
+                        except Exception:
+                            pass  # table may not exist yet on a truly fresh DB
+                engine.dispose()
+                logger.info(
+                    f"Cleared stale training DB records for simulation '{sim_id}'"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Could not clear stale DB training data for '{sim_id}': {exc}"
+                )
+
     def _world_order(self, episode: int) -> list[World]:
         """Return the per-episode world advancement order (alternates if enabled)."""
         if self.swap_order_per_episode and episode % 2 == 0:
