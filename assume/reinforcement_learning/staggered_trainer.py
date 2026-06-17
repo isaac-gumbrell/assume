@@ -474,12 +474,14 @@ class StaggeredTrainer:
         mirroring the anchor's already-correct exploration state.
         """
         for unit_id, sec_strat in self.secondary.learning_role.rl_strats.items():
-            if unit_id in self.anchor.learning_role.rl_strats:
-                sec_strat.collect_initial_experience_mode = (
-                    self.anchor.learning_role.rl_strats[
-                        unit_id
-                    ].collect_initial_experience_mode
-                )
+            if unit_id not in self.anchor.learning_role.rl_strats:
+                continue
+            anchor_strat = self.anchor.learning_role.rl_strats[unit_id]
+            if not hasattr(anchor_strat, "collect_initial_experience_mode"):
+                continue
+            sec_strat.collect_initial_experience_mode = (
+                anchor_strat.collect_initial_experience_mode
+            )
 
     def _clear_stale_training_db_data(self) -> None:
         """Delete old training-mode rl_params / rl_grad_params rows for this run.
@@ -495,7 +497,7 @@ class StaggeredTrainer:
         from sqlalchemy import create_engine, text
 
         for w in self.worlds:
-            if not w.db_uri:
+            if not getattr(w, "db_uri", None):
                 continue
             sim_id = w.simulation_id
             try:
