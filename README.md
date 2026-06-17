@@ -183,6 +183,21 @@ assume -s example_01b -db "postgresql://assume:assume@localhost:5432/assume"
 
 For additional CLI options, run `assume -h`.
 
+### Batch runs on remote servers
+
+The `runner.py` script at the repository root runs one or more study cases in
+parallel with a live progress dashboard. To keep a long batch alive across SSH
+disconnects, run it inside `tmux` (or `nohup`):
+
+```bash
+tmux new -s assume 'python runner.py --mode batch 2>&1'
+tmux attach -t assume   # reconnect from any session
+```
+
+See the [Batch runs on remote servers](https://assume.readthedocs.io/en/latest/batch_runs.html)
+guide for dashboard reading, log files, `nohup`/`systemd` alternatives, and
+configuration details.
+
 ## Development
 
 [The Contribution Guidelines explain how to setup your development environment and contribute to the project.](./CONTRIBUTING.md#development-setup)

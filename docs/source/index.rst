@@ -89,6 +89,7 @@ User Guide
 * :doc:`distributed_simulation`
 * :doc:`manual_simulation`
 * :doc:`realtime_simulation`
+* :doc:`batch_runs`
 * :doc:`command_line_interface`
 * :doc:`assume`
 
@@ -112,6 +113,7 @@ User Guide
    distributed_simulation
    manual_simulation
    realtime_simulation
+   batch_runs
    command_line_interface
    assume
 

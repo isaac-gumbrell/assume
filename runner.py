@@ -96,6 +96,51 @@ def format_elapsed(seconds: float) -> str:
     return " ".join(parts)
 
 
+def _parse_elapsed_seconds(label: str) -> float | None:
+    """Inverse of :func:`format_elapsed` — parse a compact duration label.
+
+    Accepts tokens like ``"3h 5m"``, ``"12m"``, ``"45s"``, ``"2d 1h"``.
+    Returns total seconds, or None if the label cannot be parsed.
+    """
+    if not label:
+        return None
+    total = 0.0
+    found = False
+    for token in label.split():
+        m = re.match(r"^(\d+)([dhms])$", token)
+        if not m:
+            return None
+        value = int(m.group(1))
+        unit = m.group(2)
+        total += value * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+        found = True
+    return total if found else None
+
+
+def _format_eta_compact(seconds: float) -> str:
+    """Compact ETA label that drops trailing zero units.
+
+    ``format_elapsed`` always includes seconds (e.g. ``"12m 0s"``); for the
+    dashboard we prefer ``"12m"``. Round to the nearest second first.
+    """
+    seconds = int(round(seconds))
+    td = timedelta(seconds=seconds)
+    days = td.days
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    # Drop seconds unless everything else is zero (keeps sub-minute ETAs).
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 def build_task_name(scenario: str, study_case: str) -> str:
     return f"{scenario}__{study_case}"
 
@@ -189,12 +234,21 @@ class TqdmCapture(io.TextIOBase):
        episode start, every 5th episode, and completion).
     3. Writes the full tqdm line to the case log file for post-hoc review.
 
-    ASSUME has two tqdm bars:
-      - Outer (run_learning): "Training Episodes:  40%|████ | 30/75"
+    ASSUME has two tqdm bars (three for staggered):
+      - Outer (run_learning / StaggeredTrainer.run):
+        "Training Episodes:  40%|████ | 30/75"
+        "Staggered Training Episodes:  40%|████ | 30/75"
       - Inner (world.async_run): "Training Episode 5 2025-03-15 14:00:  8%|█ | 2628000/31276800"
+      - Chunk (StaggeredTrainer._run_episode_chunked):
+        "Episode chunks (bau/inv):  20%|██ | 4/20"
+
+    For staggered cases the compact status combines episode + chunk progress
+    with ETAs, e.g. "Ep 5/75 ep 20% ETA 12m | all 6% ETA 3h".
     """
 
-    _RE_OUTER = re.compile(r"Training Episodes.*?(\d+)%\|.*?\|\s*(\d+)/(\d+)")
+    _RE_OUTER = re.compile(
+        r"(?:Staggered )?Training Episodes.*?(\d+)%\|.*?\|\s*(\d+)/(\d+)"
+    )
     _RE_INNER = re.compile(
         r"(Training|Evaluation) Episode (\d+) ([\d-]+ [\d:]+).*?(\d+)%"
     )
@@ -209,6 +263,15 @@ class TqdmCapture(io.TextIOBase):
         self._last_logged_episode = 0
         self._last_mode = None
         self._total_episodes = None
+        # Staggered / chunk tracking
+        self._is_staggered = False
+        self._chunk_current = 0
+        self._chunk_total = 0
+        self._episode_start_time = None
+        self._first_episode_time = None
+        # Non-staggered inner-bar tracking (for ETA on sim %)
+        self._sim_pct = 0
+        self._sim_start_time = None
         os.makedirs(os.path.dirname(progress_path), exist_ok=True)
 
     def writable(self):
@@ -240,6 +303,22 @@ class TqdmCapture(io.TextIOBase):
         m = self._RE_OUTER.search(line)
         if m:
             pct, current, total = m.group(1), m.group(2), m.group(3)
+            self._total_episodes = int(total)
+            self._is_staggered = line.startswith("Staggered ")
+            # On outer-bar refresh, (re)start the episode clock if the episode
+            # changed. The outer bar fires once per episode in staggered mode.
+            cur = int(current)
+            if self._episode_start_time is None or cur != self._last_logged_episode:
+                self._episode_start_time = time.time()
+                if self._first_episode_time is None:
+                    self._first_episode_time = self._episode_start_time
+            if self._is_staggered:
+                # Outer bar alone (between episodes) — show episode-level ETA.
+                overall_pct = cur / self._total_episodes if self._total_episodes else 0
+                full_eta = self._compute_eta(self._first_episode_time, overall_pct)
+                return self._fmt_staggered(
+                    cur, self._total_episodes, None, None, full_eta
+                )
             return f"Ep {current}/{total} ({pct}%)"
         m = self._RE_INNER.search(line)
         if m:
@@ -249,13 +328,47 @@ class TqdmCapture(io.TextIOBase):
                 m.group(3),
                 m.group(4),
             )
+            self._sim_pct = int(sim_pct) / 100.0
+            if self._sim_start_time is None:
+                self._sim_start_time = time.time()
             if mode == "Evaluation":
-                return f"Eval {ep_num} sim {sim_pct}%"
+                eta = self._compute_eta(self._sim_start_time, self._sim_pct)
+                eta_s = self._fmt_eta_short(eta)
+                return f"Eval {ep_num} sim {sim_pct}% ETA {eta_s}"
             total_str = f"/{self._total_episodes}" if self._total_episodes else ""
-            return f"Ep {ep_num}{total_str} sim {sim_pct}%"
+            eta = self._compute_eta(self._sim_start_time, self._sim_pct)
+            eta_s = self._fmt_eta_short(eta)
+            return f"Ep {ep_num}{total_str} sim {sim_pct}% ETA {eta_s}"
         m = self._RE_CHUNKS.search(line)
         if m:
             pct, current, total = m.group(1), m.group(2), m.group(3)
+            self._chunk_current = int(current)
+            self._chunk_total = int(total)
+            if self._episode_start_time is None:
+                self._episode_start_time = time.time()
+            if self._first_episode_time is None:
+                self._first_episode_time = self._episode_start_time
+            # Staggered: combine episode + chunk progress with ETAs.
+            if self._total_episodes and self._last_logged_episode:
+                ep_pct = (
+                    self._chunk_current / self._chunk_total
+                    if self._chunk_total
+                    else 0.0
+                )
+                overall_pct = (
+                    (self._last_logged_episode - 1 + ep_pct) / self._total_episodes
+                    if self._total_episodes
+                    else 0.0
+                )
+                ep_eta = self._compute_eta(self._episode_start_time, ep_pct)
+                full_eta = self._compute_eta(self._first_episode_time, overall_pct)
+                return self._fmt_staggered(
+                    self._last_logged_episode,
+                    self._total_episodes,
+                    ep_pct,
+                    ep_eta,
+                    full_eta,
+                )
             return f"chunks {current}/{total} ({pct}%)"
         if "episode chunks" in line.lower():
             # desc was long enough to truncate the bar — show what we have
@@ -272,6 +385,45 @@ class TqdmCapture(io.TextIOBase):
             return f"sim {pct_match.group(1)}%"
         return line[:60]
 
+    @staticmethod
+    def _compute_eta(start_time: float | None, pct: float) -> float | None:
+        """Extrapolate remaining seconds from elapsed time and fractional progress."""
+        if start_time is None or pct is None or pct <= 0.001 or pct >= 0.999:
+            return None
+        elapsed = time.time() - start_time
+        if elapsed < 1.0:
+            return None
+        return max(0.0, elapsed * (1.0 / pct - 1.0))
+
+    @staticmethod
+    def _fmt_eta_short(seconds: float | None) -> str:
+        """Compact ETA label: '12m', '3h 5m', '45s', or '…' if unknown."""
+        if seconds is None:
+            return "…"
+        return _format_eta_compact(seconds)
+
+    def _fmt_staggered(
+        self,
+        ep_cur: int,
+        ep_total: int,
+        ep_pct: float | None,
+        ep_eta: float | None,
+        full_eta: float | None,
+    ) -> str:
+        """Build the compact staggered status line.
+
+        Examples:
+            Ep 5/75 ep 20% ETA 12m | all 6% ETA 3h
+            Ep 5/75 ep … | all 6% ETA 3h          (chunk bar not yet seen)
+        """
+        if ep_pct is not None:
+            ep_str = f"ep {int(round(ep_pct * 100))}% ETA {self._fmt_eta_short(ep_eta)}"
+        else:
+            ep_str = "ep …"
+        overall = ep_cur / ep_total if ep_total else 0.0
+        all_str = f"all {int(round(overall * 100))}% ETA {self._fmt_eta_short(full_eta)}"
+        return f"Ep {ep_cur}/{ep_total} {ep_str} | {all_str}"
+
     def _log_milestones(self, line: str):
         m = self._RE_OUTER.search(line)
         if m:
@@ -279,7 +431,12 @@ class TqdmCapture(io.TextIOBase):
             total = int(m.group(3))
             self._total_episodes = total
             if current != self._last_logged_episode:
+                # New episode: reset chunk + episode clock.
                 self._last_logged_episode = current
+                self._chunk_current = 0
+                self._episode_start_time = time.time()
+                if self._first_episode_time is None:
+                    self._first_episode_time = self._episode_start_time
                 if current == 1 or current == total or current % 5 == 0:
                     self._logger.info(
                         "Training episode %d/%d (%s%%)", current, total, m.group(1)
@@ -602,10 +759,26 @@ class ProcessMonitor:
             path = os.path.join(self.progress_dir, case_name)
             if os.path.exists(path):
                 with open(path) as f:
-                    return f.read().strip()[:35]
+                    return f.read().strip()
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _parse_eta_seconds(progress_str: str) -> float | None:
+        """Extract an ETA in seconds from a compact progress string.
+
+        Looks for the last ``ETA <time>`` token (the full-run ETA in staggered
+        strings, the only ETA in non-staggered strings). Returns None if no
+        parseable ETA is present.
+        """
+        if not progress_str:
+            return None
+        # An ETA token runs from "ETA" up to the next "|" or end of string.
+        matches = re.findall(r"ETA\s+([^|]+?)(?=\s*\||\s*$)", progress_str)
+        if not matches:
+            return None
+        return _parse_elapsed_seconds(matches[-1].strip())
 
     def _loop(self):
         while not self._stop_event.is_set():
@@ -628,6 +801,11 @@ class ProcessMonitor:
         with self._lock:
             statuses = dict(self._statuses)
             self._system_peak_mem_pct = max(self._system_peak_mem_pct, sys_mem_pct)
+
+        # Dynamic column widths — handle long scenario names gracefully.
+        case_w = max(35, min(max((len(c) for c in self._cases), default=35), 50))
+        prog_w = 42
+        W = case_w + 55
 
         rows = []
         for case in self._cases:
@@ -654,29 +832,42 @@ class ProcessMonitor:
 
         elapsed = time.time() - self._batch_start
         elapsed_str = str(timedelta(seconds=int(elapsed)))
-        W = 90
+
+        # Batch ETA: sum of remaining seconds across running cases.
+        batch_eta_seconds: float | None = None
+        for _, _, status, _, progress in rows:
+            if status == "running":
+                eta = self._parse_eta_seconds(progress)
+                if eta is not None:
+                    batch_eta_seconds = (batch_eta_seconds or 0) + eta
+        batch_eta_str = (
+            format_elapsed(batch_eta_seconds) if batch_eta_seconds is not None else "—"
+        )
 
         lines = []
         lines.append(f"  {'─' * W}")
         lines.append(
             f"  ASSUME Batch Monitor [{self._run_id}]    "
             f"Elapsed: {elapsed_str}    "
+            f"Batch ETA: {batch_eta_str}    "
             f"MEM: {sys_mem_used_gb:.1f} / {sys_mem_total_gb:.1f} GB ({sys_mem_pct:.1f}%)"
         )
         lines.append(f"  {'─' * W}")
         lines.append(
-            f"  {'Case':<35} {'PID':>7}  {'Status':<10} {'RSS MB':>8}  {'Progress':<30}"
+            f"  {'Case':<{case_w}} {'PID':>7}  {'Status':<10} {'RSS MB':>8}  {'Progress':<{prog_w}}"
         )
         lines.append(f"  {'─' * W}")
 
         for case, pid, status, rss_mb, progress in rows:
             pid_str = f"{pid:>7}" if pid else "    ..."
+            # Truncate long case names with an ellipsis.
+            if len(case) > case_w:
+                case_str = case[: case_w - 1] + "…"
+            else:
+                case_str = case
             if status == "running":
-                status_str, rss_str, prog_str = (
-                    "running",
-                    f"{rss_mb:7.1f}",
-                    progress or "",
-                )
+                status_str, rss_str = "running", f"{rss_mb:7.1f}"
+                prog_str = progress[:prog_w] if progress else ""
             elif status in ("completed", "done"):
                 status_str, rss_str, prog_str = "done", "      —", "finished"
             elif status == "failed":
@@ -686,7 +877,7 @@ class ProcessMonitor:
             else:
                 status_str, rss_str, prog_str = status, "      —", ""
             lines.append(
-                f"  {case:<35} {pid_str}  {status_str:<10} {rss_str}  {prog_str}"
+                f"  {case_str:<{case_w}} {pid_str}  {status_str:<10} {rss_str}  {prog_str}"
             )
 
         lines.append(f"  {'─' * W}")
