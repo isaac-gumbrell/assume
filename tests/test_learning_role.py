@@ -153,6 +153,52 @@ def test_learning_runtime_state_roundtrip(tmp_path):
 
 
 @pytest.mark.require_learning
+def test_inter_episodic_data_preserves_n_updates():
+    """The global gradient-update counter must survive the inter-episodic
+    round-trip. Between episodes ``setup_world`` recreates the rl_algorithm
+    (resetting ``n_updates`` to 0); without carrying it through
+    ``get_inter_episodic_data``/``load_inter_episodic_data`` the TensorBoard
+    gradient-step x-axis would restart at 0 every episode.
+    """
+    config = {
+        "foresight": 1,
+        "act_dim": 2,
+        "unique_obs_dim": 0,
+        "learning_config": LearningConfig(
+            train_freq="1h",
+            algorithm="matd3",
+            actor_architecture="mlp",
+            learning_mode=True,
+            evaluation_mode=False,
+            training_episodes=3,
+            episodes_collecting_initial_experience=1,
+            continue_learning=False,
+            trained_policies_save_path=None,
+            early_stopping_steps=10,
+            early_stopping_threshold=0.05,
+        ),
+    }
+
+    learn = Learning(config["learning_config"], start=start, end=end)
+    learn.rl_strats["test_id"] = LearningStrategy(**config, learning_role=learn)
+    learn.initialize_policy()
+    learn.rl_algorithm.n_updates = 137
+
+    inter_episodic_data = learn.get_inter_episodic_data()
+    assert inter_episodic_data["n_updates"] == 137
+
+    # Mimic a new episode: fresh learning role / algorithm (n_updates resets to 0).
+    next_episode = Learning(config["learning_config"], start=start, end=end)
+    next_episode.rl_strats["test_id"] = LearningStrategy(
+        **config, learning_role=next_episode
+    )
+    assert next_episode.rl_algorithm.n_updates == 0
+
+    next_episode.load_inter_episodic_data(inter_episodic_data)
+    assert next_episode.rl_algorithm.n_updates == 137
+
+
+@pytest.mark.require_learning
 def test_write_rl_grad_params_uses_global_update_counter():
     """Gradient-step logging must follow TD3.n_updates to avoid collisions in
     staggered mode where update_policy can run more than once per chunk.

@@ -383,6 +383,13 @@ class Learning(Role):
 
         self.initialize_policy(inter_episodic_data["actors_and_critics"])
 
+        # Restore the global gradient-update counter. ``setup_world`` recreates the
+        # rl_algorithm each episode (resetting ``n_updates`` to 0), so without this
+        # the TensorBoard gradient-step x-axis (derived from ``n_updates``) would
+        # restart at 0 every episode and produce overlapping curves.
+        if "n_updates" in inter_episodic_data and self.rl_algorithm is not None:
+            self.rl_algorithm.n_updates = int(inter_episodic_data["n_updates"])
+
         # Disable initial exploration if initial experience collection is complete
         if (
             self.episodes_done
@@ -410,6 +417,7 @@ class Learning(Role):
             "avg_all_eval": self.avg_rewards,
             "buffer": self.buffer,
             "actors_and_critics": self.rl_algorithm.extract_policy(),
+            "n_updates": int(getattr(self.rl_algorithm, "n_updates", 0)),
         }
 
     def export_runtime_state(self) -> dict:
