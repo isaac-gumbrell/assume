@@ -37,13 +37,35 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import psutil
-import torch as th
-import yaml
+# ---------------------------------------------------------------------------
+# Thread-pool clamps — MUST be set before numpy / torch / BLAS are imported.
+#
+# Each worker runs its own ASSUME simulation. PyTorch *and* the BLAS backends
+# behind numpy / pandas / scipy / PyPSA otherwise default to one thread per
+# *core* for intra-op parallelism. With ~50 workers on 64 cores that is
+# 50 × 64 ≈ 3200 threads fighting over 64 cores — catastrophic oversubscription.
+#
+# torch.set_num_threads() (applied per-worker in run_single_case) only governs
+# PyTorch's own pool; it does NOT touch the OpenMP / MKL / OpenBLAS pools used
+# by numpy et al., and those env vars are only read once at import time.
+# Clamping them here is the safe, high-value complement to set_num_threads().
+# Override by exporting any of these variables in your shell before launching.
+for _thread_var in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_thread_var, "1")
 
-from assume import World
-from assume.common.outputs import DatabaseMaintenance
-from assume.scenario.loader_csv import (
+import psutil  # noqa: E402
+import torch as th  # noqa: E402
+import yaml  # noqa: E402
+
+from assume import World  # noqa: E402
+from assume.common.outputs import DatabaseMaintenance  # noqa: E402
+from assume.scenario.loader_csv import (  # noqa: E402
     load_config_and_create_forecaster,
     load_scenario_folder,
     run_learning,
@@ -421,7 +443,9 @@ class TqdmCapture(io.TextIOBase):
         else:
             ep_str = "ep …"
         overall = ep_cur / ep_total if ep_total else 0.0
-        all_str = f"all {int(round(overall * 100))}% ETA {self._fmt_eta_short(full_eta)}"
+        all_str = (
+            f"all {int(round(overall * 100))}% ETA {self._fmt_eta_short(full_eta)}"
+        )
         return f"Ep {ep_cur}/{ep_total} {ep_str} | {all_str}"
 
     def _log_milestones(self, line: str):
@@ -574,7 +598,12 @@ def run_single_case(
         shared_pids[task_name] = os.getpid()
 
     th.set_num_threads(threads_per_process)
-    th.set_num_interop_threads(interop_threads)
+    try:
+        th.set_num_interop_threads(interop_threads)
+    except RuntimeError:
+        # interop thread count can only be set once, before any parallel work
+        # has started in this process; ignore if torch already initialised it.
+        pass
 
     logger = setup_case_logger(task_name, log_dir)
 
