@@ -76,18 +76,20 @@ def test_replay_buffer_add():
     buffer.add(obs, actions, reward)
 
     sample = buffer.sample(1)
-    (observations, actions, next_observations, rewards) = sample
+    (observations, actions, next_observations, rewards, masks) = sample
 
     assert rewards.shape == (1, 4)
+    assert masks.shape == (1, 4)
     assert actions.shape == (1, 4, 3)
     assert next_observations.shape == (1, 4, 2)
     assert observations.shape == (1, 4, 2)
 
     # now sample twice
     sample = buffer.sample(2)
-    (observations, actions, next_observations, rewards) = sample
+    (observations, actions, next_observations, rewards, masks) = sample
 
     assert rewards.shape == (2, 4)
+    assert masks.shape == (2, 4)
     assert actions.shape == (2, 4, 3)
     assert next_observations.shape == (2, 4, 2)
     assert observations.shape == (2, 4, 2)

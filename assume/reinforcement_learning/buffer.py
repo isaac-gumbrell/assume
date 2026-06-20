@@ -21,6 +21,7 @@ class ReplayBufferSamples(NamedTuple):
     actions: th.Tensor
     next_observations: th.Tensor
     rewards: th.Tensor
+    masks: th.Tensor
 
 
 class ReplayBuffer:
@@ -71,6 +72,13 @@ class ReplayBuffer:
             (self.buffer_size, self.n_rl_units, self.act_dim), dtype=self.np_float_type
         )
         self.rewards = np.zeros(
+            (self.buffer_size, self.n_rl_units), dtype=self.np_float_type
+        )
+        # Per-agent activity mask: 1.0 = trainable transition, 0.0 = the unit was
+        # forced off (e.g. availability=0 for foreign units in staggered training)
+        # and must be excluded from the policy update. Defaults to 1.0 so buffers
+        # built without explicit masks behave exactly as before.
+        self.masks = np.ones(
             (self.buffer_size, self.n_rl_units), dtype=self.np_float_type
         )
 
@@ -126,6 +134,7 @@ class ReplayBuffer:
         obs: np.ndarray,
         actions: np.ndarray,
         reward: np.ndarray,
+        mask: np.ndarray = None,
     ):
         """
         Adds an observation, action, and reward of all agents to the replay buffer.
@@ -134,6 +143,8 @@ class ReplayBuffer:
             obs (numpy.ndarray): The observation to add.
             actions (numpy.ndarray): The actions to add.
             reward (numpy.ndarray): The reward to add.
+            mask (numpy.ndarray, optional): Per-agent activity mask (1.0 = trainable,
+                0.0 = forced off). Defaults to all-ones when omitted.
         """
         # copying all to avoid modification
         len_obs = obs.shape[0]
@@ -142,6 +153,10 @@ class ReplayBuffer:
         self.rewards[self.pos : self.pos + len_obs] = np.squeeze(
             reward.copy(), axis=-1
         )  # alsways one reward value per agent and time-step hence squezze
+        if mask is None:
+            self.masks[self.pos : self.pos + len_obs] = 1.0
+        else:
+            self.masks[self.pos : self.pos + len_obs] = mask.copy()
 
         self.pos += len_obs
         if self.pos + len_obs >= self.buffer_size:
@@ -172,6 +187,7 @@ class ReplayBuffer:
             self.actions[batch_inds, :, :],
             self.observations[batch_inds + 1, :, :],
             self.rewards[batch_inds],
+            self.masks[batch_inds],
         )
 
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
@@ -188,6 +204,7 @@ class ReplayBuffer:
             observations=self.observations,
             actions=self.actions,
             rewards=self.rewards,
+            masks=self.masks,
             pos=np.array([self.pos]),
             full=np.array([self.full]),
         )
@@ -211,6 +228,12 @@ class ReplayBuffer:
         buffer.observations = obs
         buffer.actions = acts
         buffer.rewards = rews
+        # Backward compatibility: buffers saved before masks were introduced default
+        # to all-ones (every transition treated as trainable).
+        if "masks" in data:
+            buffer.masks = data["masks"]
+        else:
+            buffer.masks = np.ones_like(rews)
         buffer.pos = int(data["pos"][0])
         buffer.full = bool(data["full"][0])
         return buffer

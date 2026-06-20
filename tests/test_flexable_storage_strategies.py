@@ -154,7 +154,7 @@ def test_flexable_eom_storage(mock_market_config, storage):
 
 
 def test_flexable_pos_crm_storage(mock_market_config, storage):
-    index = pd.date_range("2023-07-01", periods=4, freq="h")
+    index = pd.date_range("2023-07-01", periods=48, freq="h")
     start = datetime(2023, 7, 1)
     end = datetime(2023, 7, 1, 4, 0, 0)
     strategy = StorageCapacityHeuristicBalancingPosStrategy()
@@ -195,7 +195,7 @@ def test_flexable_pos_crm_storage(mock_market_config, storage):
 
 
 def test_flexable_neg_crm_storage(mock_market_config, storage):
-    index = pd.date_range("2023-07-01", periods=4, freq="h")
+    index = pd.date_range("2023-07-01", periods=48, freq="h")
     start = datetime(2023, 7, 1)
     end = datetime(2023, 7, 1, 4, 0, 0)
     strategy = StorageCapacityHeuristicBalancingNegStrategy()

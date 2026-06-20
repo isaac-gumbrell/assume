@@ -120,6 +120,42 @@ def test_calculate_operational_window(storage_unit):
     start = start + timedelta(hours=1)
 
 
+def test_availability_forces_off():
+    # A storage unit whose forecaster reports availability=0 must be fully off:
+    # both charging and discharging bounds collapse to zero. This is relied upon by
+    # staggered training, where foreign units are neutralised via availability=0.
+    index = pd.date_range("2022-01-01", periods=4, freq="h")
+    forecaster = UnitForecaster(index, availability=0, market_prices={"EOM": 50})
+    storage_unit = Storage(
+        id="Off_Storage",
+        unit_operator="TestOperator",
+        technology="TestTechnology",
+        bidding_strategies={"EOM": StorageEnergyHeuristicFlexableStrategy()},
+        forecaster=forecaster,
+        max_power_charge=-100,
+        max_power_discharge=100,
+        capacity=1000,
+        efficiency_charge=0.9,
+        efficiency_discharge=0.95,
+        initial_soc=0.5,
+    )
+
+    start = datetime(2022, 1, 1, 0)
+    end = datetime(2022, 1, 1, 1)
+
+    min_power_charge, max_power_charge = storage_unit.calculate_min_max_charge(
+        start, end
+    )
+    assert min_power_charge[0] == 0
+    assert max_power_charge[0] == 0
+
+    min_power_discharge, max_power_discharge = storage_unit.calculate_min_max_discharge(
+        start, end
+    )
+    assert min_power_discharge[0] == 0
+    assert max_power_discharge[0] == 0
+
+
 def test_soc_constraint(storage_unit):
     # start should not be the first hour of index to manipulate soc
     start = datetime(2022, 1, 1, 1)

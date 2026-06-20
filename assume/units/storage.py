@@ -431,10 +431,18 @@ class Storage(SupportsMinMaxCharge):
         capacity_pos = self.outputs["capacity_pos"].loc[start:end_excl]
         capacity_neg = self.outputs["capacity_neg"].loc[start:end_excl]
 
-        min_power_charge = self.min_power_charge - (base_load + capacity_pos)
+        # availability scales the technical charging limits; a value of 0 forces the
+        # unit fully off (used e.g. for foreign units in staggered training).
+        availability = self.forecaster.availability.loc[start:end_excl]
+
+        min_power_charge = availability * self.min_power_charge - (
+            base_load + capacity_pos
+        )
         min_power_charge = min_power_charge.clip(max=0)
 
-        max_power_charge = self.max_power_charge - (base_load + capacity_neg)
+        max_power_charge = availability * self.max_power_charge - (
+            base_load + capacity_neg
+        )
         max_power_charge = np.where(
             max_power_charge <= min_power_charge, max_power_charge, 0
         )
@@ -473,10 +481,18 @@ class Storage(SupportsMinMaxCharge):
         capacity_pos = self.outputs["capacity_pos"].loc[start:end_excl]
         capacity_neg = self.outputs["capacity_neg"].loc[start:end_excl]
 
-        min_power_discharge = self.min_power_discharge - (base_load + capacity_neg)
+        # availability scales the technical discharging limits; a value of 0 forces
+        # the unit fully off (used e.g. for foreign units in staggered training).
+        availability = self.forecaster.availability.loc[start:end_excl]
+
+        min_power_discharge = availability * self.min_power_discharge - (
+            base_load + capacity_neg
+        )
         min_power_discharge = min_power_discharge.clip(min=0)
 
-        max_power_discharge = self.max_power_discharge - (base_load + capacity_pos)
+        max_power_discharge = availability * self.max_power_discharge - (
+            base_load + capacity_pos
+        )
 
         # Adjust max_power_discharge using np.where
         max_power_discharge = np.where(

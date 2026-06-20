@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch as th
 from mango import Role
@@ -123,6 +124,7 @@ class Learning(Role):
             self.all_rewards = defaultdict(lambda: defaultdict(list))
             self.all_regrets = defaultdict(lambda: defaultdict(list))
             self.all_profits = defaultdict(lambda: defaultdict(list))
+            self.all_active = defaultdict(lambda: defaultdict(list))
 
     def on_ready(self):
         """
@@ -237,6 +239,7 @@ class Learning(Role):
         current_noises = self.all_noises
         current_regrets = self.all_regrets
         current_profits = self.all_profits
+        current_active = self.all_active
 
         # Reset cache dicts immediately with new defaultdicts
         self.all_obs = defaultdict(lambda: defaultdict(list))
@@ -245,6 +248,7 @@ class Learning(Role):
         self.all_noises = defaultdict(lambda: defaultdict(list))
         self.all_regrets = defaultdict(lambda: defaultdict(list))
         self.all_profits = defaultdict(lambda: defaultdict(list))
+        self.all_active = defaultdict(lambda: defaultdict(list))
 
         # Get timestamps from cache we took
         all_timestamps = sorted(current_obs.keys())
@@ -272,6 +276,7 @@ class Learning(Role):
                 "noises": {t: current_noises[t] for t in timestamps_to_process},
                 "regret": {t: current_regrets[t] for t in timestamps_to_process},
                 "profit": {t: current_profits[t] for t in timestamps_to_process},
+                "active": {t: current_active[t] for t in timestamps_to_process},
             }
 
             # write data to output agent
@@ -313,6 +318,10 @@ class Learning(Role):
             reward=transform_buffer_data(
                 cache["rewards"], device, self.rl_strats.keys()
             ),
+            mask=np.squeeze(
+                transform_buffer_data(cache["active"], device, self.rl_strats.keys()),
+                axis=-1,
+            ),
         )
 
         if (
@@ -353,18 +362,23 @@ class Learning(Role):
         self.all_actions[start][unit_id].append(action)
         self.all_noises[start][unit_id].append(noise)
 
-    def add_reward_to_cache(self, unit_id, start, reward, regret, profit) -> None:
+    def add_reward_to_cache(
+        self, unit_id, start, reward, regret, profit, active=1.0
+    ) -> None:
         """
         Add the reward to the cache dict, per unit_id.
 
         Args:
             unit_id (str): The id of the unit.
             reward (float): The reward to be added.
+            active (float): Activity mask for this transition (1.0 = trainable,
+                0.0 = the unit was forced off and should be excluded from training).
 
         """
         self.all_rewards[start][unit_id].append(reward)
         self.all_regrets[start][unit_id].append(regret)
         self.all_profits[start][unit_id].append(profit)
+        self.all_active[start][unit_id].append(active)
 
     def load_inter_episodic_data(self, inter_episodic_data):
         """

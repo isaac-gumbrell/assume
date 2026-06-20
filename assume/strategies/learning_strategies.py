@@ -650,10 +650,17 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         profit_scale = 1
         profit = min(profit, profit_scale * abs(profit))
 
+        # Available capacity actually offered this period (availability-adjusted via
+        # calculate_min_max_power). Using this instead of nameplate ``unit.max_power``
+        # avoids penalising a unit for capacity it is physically unable to provide,
+        # e.g. a foreign unit forced off (availability=0) in staggered training, which
+        # would otherwise receive a spurious negative reward and poison the policy.
+        available_power = offered_volume_total
+
         # Opportunity cost: The income lost due to not operating at full capacity.
         opportunity_cost = (
             (market_clearing_price - marginal_cost)
-            * (unit.max_power - accepted_volume_total)
+            * (available_power - accepted_volume_total)
             * duration
         )
 
@@ -675,6 +682,10 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         regret = regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
+        # A unit that was forced off (no available capacity) cannot influence the
+        # market this period, so its transition carries no learning signal.
+        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+
         # Store results in unit outputs
         # Note: these are not learning-specific results but stored for all units for analysis
         unit.outputs["profit"].loc[start:end_excl] += profit
@@ -683,7 +694,7 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         # write rl-rewards to buffer
         if self.learning_mode:
             self.learning_role.add_reward_to_cache(
-                unit.id, start, reward, regret, profit
+                unit.id, start, reward, regret, profit, active
             )
 
 
@@ -1087,9 +1098,15 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         unit.outputs["profit"].loc[start:end_excl] += profit
         unit.outputs["total_costs"].loc[start:end_excl] += order_cost
 
+        # A unit forced off (availability=0) cannot act this period, so its transition
+        # carries no learning signal and is masked out of the policy update.
+        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+
         # write rl-rewards to buffer
         if self.learning_mode:
-            self.learning_role.add_reward_to_cache(unit.id, start, reward, 0, profit)
+            self.learning_role.add_reward_to_cache(
+                unit.id, start, reward, 0, profit, active
+            )
 
 
 class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
@@ -1321,6 +1338,10 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         regret = regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
+        # A unit forced off (availability=0) cannot act this period, so its transition
+        # carries no learning signal and is masked out of the policy update.
+        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+
         # Store results in unit outputs
         # Note: these are not learning-specific results but stored for all units for analysis
         unit.outputs["profit"].loc[start:end_excl] += profit
@@ -1329,7 +1350,7 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         # write rl-rewards to buffer
         if self.learning_mode:
             self.learning_role.add_reward_to_cache(
-                unit.id, start, reward, regret, profit
+                unit.id, start, reward, regret, profit, active
             )
 
 
@@ -1578,12 +1599,16 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         regret = 0
         reward = scaling * (profit - regret)
 
+        # A unit forced off (availability=0) cannot act this period, so its transition
+        # carries no learning signal and is masked out of the policy update.
+        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+
         unit.outputs["profit"].loc[start:end_excl] += profit
         unit.outputs["total_costs"].loc[start:end_excl] += operational_cost
 
         if self.learning_mode:
             self.learning_role.add_reward_to_cache(
-                unit.id, start, reward, regret, profit
+                unit.id, start, reward, regret, profit, active
             )
 
 

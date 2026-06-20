@@ -7,7 +7,6 @@ import logging
 import os
 
 import torch as th
-from torch.nn import functional as F
 from torch.optim import AdamW
 
 from assume.reinforcement_learning.algorithms.base_algorithm import RLAlgorithm
@@ -535,6 +534,11 @@ class TD3(RLAlgorithm):
                 transitions.next_observations,
                 transitions.rewards,
             )
+            # Per-agent activity mask (batch_size, n_rl_agents): 1.0 = trainable,
+            # 0.0 = the unit was forced off this step (e.g. availability=0 for a
+            # foreign unit in staggered training). Masked transitions are excluded
+            # from each agent's own critic/actor loss so they do not bias the policy.
+            masks = transitions.masks
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
@@ -631,9 +635,13 @@ class TD3(RLAlgorithm):
                 # Get current Q-values estimates for each critic network
                 current_Q_values = critic(all_states, all_actions)
 
-                # Accumulate critic loss for this agent
+                # Accumulate critic loss for this agent, masking out forced-off
+                # transitions and normalising by the number of active samples so
+                # the gradient scale stays stable regardless of the active fraction.
+                mask_i = masks[:, i].unsqueeze(1)
+                mask_norm = mask_i.sum().clamp(min=1.0)
                 critic_loss = sum(
-                    F.mse_loss(current_q, target_Q_values)
+                    (mask_i * (current_q - target_Q_values) ** 2).sum() / mask_norm
                     for current_q in current_Q_values
                 )
 
@@ -711,10 +719,12 @@ class TD3(RLAlgorithm):
                         self.learning_config.batch_size, -1
                     )
 
-                    # Calculate actor loss (negative Q1 of the updated action)
-                    actor_loss = -critic.q1_forward(
-                        all_states_i, all_actions_clone
-                    ).mean()
+                    # Calculate actor loss (negative Q1 of the updated action),
+                    # masking out forced-off transitions and normalising by the
+                    # number of active samples to keep the gradient scale stable.
+                    mask_i = masks[:, i].unsqueeze(1)
+                    q1 = critic.q1_forward(all_states_i, all_actions_clone)
+                    actor_loss = -(mask_i * q1).sum() / mask_i.sum().clamp(min=1.0)
 
                     # Store the actor loss for this unit ID
                     unit_params[step][strategy.unit_id]["actor_loss"] = (
