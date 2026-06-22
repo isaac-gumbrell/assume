@@ -35,7 +35,10 @@ import pytest
 
 from assume.scenario.loader_csv import (
     _check_staggered_input_file_parity,
+    build_staggered_supersets,
+    load_config_and_create_forecaster,
     load_staggered_scenario,
+    run_staggered_evaluation,
     run_staggered_learning,
 )
 from assume.world import World
@@ -57,6 +60,14 @@ def _clean_learned_strategies() -> None:
     """Remove any leftover policy / DB artefacts from a previous run."""
     for scen in (FIXTURE_PRIMARY, FIXTURE_PAIRED):
         target = FIXTURE_INPUTS / scen / "learned_strategies"
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def _clean_supersets() -> None:
+    """Remove generated ``_superset`` folders from the example fixtures."""
+    for scen in (FIXTURE_PRIMARY, FIXTURE_PAIRED):
+        target = FIXTURE_INPUTS / scen / "_superset"
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
 
@@ -298,3 +309,316 @@ def test_input_file_parity_unit_csvs_are_ignored(tmp_path, caplog):
         _check_staggered_input_file_parity([str(scen_a), str(scen_b)], ["bau", "inv"])
 
     assert "mismatch" not in caplog.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# _superset folder + foreign_units.json manifest (standalone non-learning runs)
+# ---------------------------------------------------------------------------
+
+
+def _copy_fixture_pair(tmp_path) -> tuple[Path, Path]:
+    """Copy the paired example fixtures into ``tmp_path`` (avoids repo pollution)."""
+    _skip_if_fixture_missing()
+    bau = tmp_path / FIXTURE_PRIMARY
+    inv = tmp_path / FIXTURE_PAIRED
+    shutil.copytree(FIXTURE_INPUTS / FIXTURE_PRIMARY, bau)
+    shutil.copytree(FIXTURE_INPUTS / FIXTURE_PAIRED, inv)
+    return bau, inv
+
+
+def _foreign_powerplants() -> tuple[set[str], set[str]]:
+    """Return (foreign-in-bau, foreign-in-inv) powerplant id sets."""
+    import pandas as pd
+
+    pp_bau = pd.read_csv(
+        FIXTURE_INPUTS / FIXTURE_PRIMARY / "powerplant_units.csv", index_col=0
+    )
+    pp_inv = pd.read_csv(
+        FIXTURE_INPUTS / FIXTURE_PAIRED / "powerplant_units.csv", index_col=0
+    )
+    native_bau = set(pp_bau.index.astype(str))
+    native_inv = set(pp_inv.index.astype(str))
+    return native_inv - native_bau, native_bau - native_inv
+
+
+def test_build_supersets_writes_self_contained_folder_and_manifest(tmp_path):
+    """``build_staggered_supersets`` materialises a runnable ``_superset`` folder."""
+    import json
+
+    bau, inv = _copy_fixture_pair(tmp_path)
+    build_staggered_supersets([str(bau), str(inv)])
+
+    foreign_in_bau, _ = _foreign_powerplants()
+
+    superset = bau / "_superset"
+    # Self-contained: union unit CSVs + copied config + manifest.
+    assert (superset / "config.yaml").exists()
+    assert (superset / "powerplant_units.csv").exists()
+    assert (superset / "demand_df.csv").exists()
+    assert (superset / "foreign_units.json").exists()
+
+    manifest = json.loads((superset / "foreign_units.json").read_text())
+    assert manifest["version"] == 1
+    manifest_pp = set(manifest["foreign_unit_ids"].get("powerplant_units", []))
+    assert manifest_pp == foreign_in_bau
+
+
+def test_superset_manifest_neutralizes_foreign_units(tmp_path):
+    """Loading a ``_superset`` folder standalone forces foreign units to zero output."""
+    bau, inv = _copy_fixture_pair(tmp_path)
+    build_staggered_supersets([str(bau), str(inv)])
+
+    foreign_in_bau, _ = _foreign_powerplants()
+    if not foreign_in_bau:
+        pytest.skip("Paired fixture has identical powerplant sets; test is vacuous.")
+
+    scenario_data = load_config_and_create_forecaster(
+        str(bau), "_superset", FIXTURE_STUDY_CASE
+    )
+    unit_forecasts = scenario_data["unit_forecasts"]
+
+    # Foreign powerplants: availability all zero and flagged as foreign.
+    for fuid in foreign_in_bau:
+        fc = unit_forecasts[fuid]
+        assert (fc.availability == 0).all(), (
+            f"foreign unit {fuid!r} should have zero availability in the superset run"
+        )
+        assert fc.is_foreign is True
+
+    # Native powerplants remain active and are not flagged.
+    import pandas as pd
+
+    native_bau = set(
+        pd.read_csv(bau / "powerplant_units.csv", index_col=0).index.astype(str)
+    )
+    for nuid in native_bau - foreign_in_bau:
+        assert unit_forecasts[nuid].is_foreign is False
+
+
+def test_superset_manifest_unknown_id_raises(tmp_path):
+    """A manifest referencing a missing unit id is a hard error."""
+    import json
+
+    bau, inv = _copy_fixture_pair(tmp_path)
+    build_staggered_supersets([str(bau), str(inv)])
+
+    manifest_path = bau / "_superset" / "foreign_units.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["foreign_unit_ids"].setdefault("powerplant_units", []).append(
+        "does_not_exist_pp"
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="does_not_exist_pp"):
+        load_config_and_create_forecaster(str(bau), "_superset", FIXTURE_STUDY_CASE)
+
+
+def _make_synthetic_pair(tmp_path) -> tuple[Path, Path]:
+    """Build two synthetic scenarios that diverge in every unit type.
+
+    Starts from a copy of the example primary scenario (which provides a valid
+    ``config.yaml``, ``demand_df.csv`` and ``fuel_prices_df.csv``) and injects
+    divergent powerplant, storage and demand units so that loading either
+    scenario's superset exercises foreign neutralisation for *all three* unit
+    types.
+
+    Returns ``(scen_a, scen_b)`` where, relative to ``scen_a``:
+        * ``pp_foreign``      — a powerplant that exists only in ``scen_b``
+        * ``st_foreign``      — a storage unit that exists only in ``scen_b``
+        * ``demand_foreign``  — a demand unit that exists only in ``scen_b``
+    and ``st_a_only`` is a storage unit that exists only in ``scen_a`` (so it is
+    foreign from ``scen_b``'s perspective).
+    """
+    import pandas as pd
+
+    _skip_if_fixture_missing()
+    scen_a = tmp_path / "scen_a"
+    scen_b = tmp_path / "scen_b"
+    shutil.copytree(FIXTURE_INPUTS / FIXTURE_PRIMARY, scen_a)
+    shutil.copytree(FIXTURE_INPUTS / FIXTURE_PRIMARY, scen_b)
+
+    storage_cols = [
+        "technology",
+        "bidding_EOM",
+        "max_power_charge",
+        "max_power_discharge",
+        "capacity",
+        "max_soc",
+        "min_soc",
+        "efficiency_charge",
+        "efficiency_discharge",
+        "unit_operator",
+    ]
+
+    def _storage_row(name: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [["PSPP", "naive", 100, 100, 1000, 1000, 0, 0.9, 0.9, "Operator 1"]],
+            columns=storage_cols,
+            index=pd.Index([name], name="name"),
+        )
+
+    # scen_a gets a storage unit that only it owns.
+    _storage_row("st_a_only").to_csv(scen_a / "storage_units.csv")
+
+    # scen_b gets a divergent storage unit, an extra powerplant and an extra
+    # demand unit (each foreign from scen_a's perspective).
+    _storage_row("st_foreign").to_csv(scen_b / "storage_units.csv")
+
+    pp_b = pd.read_csv(scen_b / "powerplant_units.csv", index_col=0)
+    pp_extra = pp_b.iloc[[0]].copy()
+    pp_extra.index = pd.Index(["pp_foreign"], name=pp_b.index.name)
+    pd.concat([pp_b, pp_extra]).to_csv(scen_b / "powerplant_units.csv")
+
+    dem_b = pd.read_csv(scen_b / "demand_units.csv", index_col=0)
+    dem_extra = dem_b.iloc[[0]].copy()
+    dem_extra.index = pd.Index(["demand_foreign"], name=dem_b.index.name)
+    pd.concat([dem_b, dem_extra]).to_csv(scen_b / "demand_units.csv")
+
+    return scen_a, scen_b
+
+
+def test_superset_neutralizes_all_foreign_unit_types(tmp_path):
+    """Foreign powerplants, storages and demand units are all forced to zero."""
+    scen_a, scen_b = _make_synthetic_pair(tmp_path)
+    build_staggered_supersets([str(scen_a), str(scen_b)])
+
+    scenario_data = load_config_and_create_forecaster(
+        str(scen_a), "_superset", FIXTURE_STUDY_CASE
+    )
+    unit_forecasts = scenario_data["unit_forecasts"]
+
+    # Foreign powerplant and storage: availability all zero + flagged foreign.
+    for fuid in ("pp_foreign", "st_foreign"):
+        fc = unit_forecasts[fuid]
+        assert (fc.availability == 0).all(), (
+            f"foreign unit {fuid!r} should have zero availability"
+        )
+        assert fc.is_foreign is True
+
+    # Foreign demand: demand profile forced to zero (no load contribution).
+    demand_fc = unit_forecasts["demand_foreign"]
+    assert demand_fc.is_foreign is True
+    assert (demand_fc.availability == 0).all()
+    assert (demand_fc.demand == 0).all(), (
+        "foreign demand unit should contribute zero load"
+    )
+
+    # Native units across all types stay active and are not flagged foreign.
+    for nuid in ("pp_1", "st_a_only", "demand_EOM"):
+        assert unit_forecasts[nuid].is_foreign is False
+    # A native demand unit keeps a non-zero load somewhere in the horizon.
+    assert (unit_forecasts["demand_EOM"].demand != 0).any()
+
+
+def test_superset_manifest_symmetry_between_scenarios(tmp_path):
+    """Each scenario's manifest lists exactly the units native only to the other."""
+    import json
+
+    scen_a, scen_b = _make_synthetic_pair(tmp_path)
+    build_staggered_supersets([str(scen_a), str(scen_b)])
+
+    man_a = json.loads((scen_a / "_superset" / "foreign_units.json").read_text())[
+        "foreign_unit_ids"
+    ]
+    man_b = json.loads((scen_b / "_superset" / "foreign_units.json").read_text())[
+        "foreign_unit_ids"
+    ]
+
+    # Foreign in A == units only in B (pp_foreign, st_foreign, demand_foreign).
+    assert set(man_a.get("powerplant_units", [])) == {"pp_foreign"}
+    assert set(man_a.get("storage_units", [])) == {"st_foreign"}
+    assert set(man_a.get("demand_units", [])) == {"demand_foreign"}
+
+    # Foreign in B == units only in A (just the storage unit st_a_only).
+    assert set(man_b.get("storage_units", [])) == {"st_a_only"}
+    assert set(man_b.get("powerplant_units", [])) == set()
+    assert set(man_b.get("demand_units", [])) == set()
+
+
+@pytest.mark.require_learning
+@pytest.mark.slow
+def test_run_staggered_evaluation_end_to_end(tmp_path):
+    """Train, then evaluate the supersets with the learned policy.
+
+    Verifies the full non-learning pipeline: the shared policy is loaded, each
+    superset world runs to completion under its own ``<scenario>_eval``
+    simulation id, and a foreign generator dispatches zero energy.
+    """
+    import sqlite3
+
+    _skip_if_fixture_missing()
+    _clean_learned_strategies()
+    _clean_supersets()
+
+    foreign_in_bau, _ = _foreign_powerplants()
+    if not foreign_in_bau:
+        pytest.skip("Paired fixture has identical powerplant sets; test is vacuous.")
+
+    train_db = f"sqlite:///{tmp_path / 'train.db'}"
+    eval_db_path = tmp_path / "eval.db"
+    eval_db = f"sqlite:///{eval_db_path}"
+
+    try:
+        run_staggered_learning(
+            inputs_path=str(FIXTURE_INPUTS),
+            scenario=FIXTURE_PRIMARY,
+            study_case=FIXTURE_STUDY_CASE,
+            db_uri=train_db,
+            export_csv_path="",
+            verbose=False,
+        )
+
+        worlds = run_staggered_evaluation(
+            inputs_path=str(FIXTURE_INPUTS),
+            scenario=FIXTURE_PRIMARY,
+            study_case=FIXTURE_STUDY_CASE,
+            db_uri=eval_db,
+            export_csv_path="",
+        )
+        assert len(worlds) == 2
+    finally:
+        _clean_learned_strategies()
+        _clean_supersets()
+
+    assert eval_db_path.exists(), "Evaluation did not produce a database file."
+
+    con = sqlite3.connect(eval_db_path)
+    try:
+        cur = con.cursor()
+        tables = {
+            r[0]
+            for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "unit_dispatch" in tables, f"unit_dispatch missing. tables={tables}"
+
+        sims = {
+            r[0]
+            for r in cur.execute(
+                "SELECT DISTINCT simulation FROM unit_dispatch"
+            ).fetchall()
+        }
+        assert f"{FIXTURE_PRIMARY}_eval" in sims, (
+            f"Expected '{FIXTURE_PRIMARY}_eval' rows, got {sims}"
+        )
+        assert f"{FIXTURE_PAIRED}_eval" in sims, (
+            f"Expected '{FIXTURE_PAIRED}_eval' rows, got {sims}"
+        )
+
+        # A foreign generator in the bau world must dispatch zero energy.
+        foreign_uid = sorted(foreign_in_bau)[0]
+        rows = cur.execute(
+            "SELECT MAX(ABS(power)) FROM unit_dispatch "
+            "WHERE simulation = ? AND unit = ?",
+            (f"{FIXTURE_PRIMARY}_eval", foreign_uid),
+        ).fetchall()
+        assert rows and rows[0][0] is not None, (
+            f"Foreign unit {foreign_uid!r} produced no dispatch rows."
+        )
+        assert rows[0][0] == 0, (
+            f"Foreign unit {foreign_uid!r} dispatched non-zero power "
+            f"(max abs = {rows[0][0]}) in the superset evaluation run."
+        )
+    finally:
+        con.close()

@@ -16,6 +16,7 @@ Upcoming Release
 **New Features:**
   - **Generic Forecasting Interface**: This interface enables to specify different forecast algorithms for preprocess, initialization and update during runtime. They can be specified in the config.yaml or unit csv files. For more information about currently implemented algorithms and how to specify them please read the documentation on Unit forecasts.
   - **Directional transfer capacities in complex clearing**: ``complex_clearing`` can now use asymmetric line limits from ``s_nom_forward`` and ``s_nom_reverse`` instead of assuming the same transfer capacity in both directions.
+  - **Runnable staggered superset scenarios**: staggered (paired-scenario) training now writes a self-contained ``_superset`` folder per scenario (union unit CSVs, copies of all other inputs, and a ``foreign_units.json`` manifest). The folder can be run standalone in non-learning mode with the learned policies; the loader reads the manifest and forces foreign generators to zero output (``availability = 0`` / ``demand = 0``). A new helper ``run_staggered_evaluation`` runs both superset scenarios with the shared trained policy.
 
 **Improvements:**
   - **In complex clearing, the solver instance is now created once during initialization of the clearing role and reused for each market clearing**. This improves performance for e.g. year-long simulations.

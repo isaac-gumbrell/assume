@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import copy
+import json
 import logging
 import os
 import shutil
@@ -719,6 +720,38 @@ def load_config_and_create_forecaster(
                 storage_units = merged
             else:
                 demand_units = merged
+    else:
+        # No paired training. Honor an optional ``foreign_units.json`` manifest
+        # (written next to a generated ``_superset`` folder) so the superset
+        # scenario can be run standalone in non-learning mode with the learned
+        # policies while foreign generators are forced to zero output. The union
+        # unit rows are already present in this folder's CSVs; we only record
+        # which ids are foreign so they can be neutralised below.
+        manifest_path = Path(path) / "foreign_units.json"
+        if manifest_path.exists():
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest_foreign = manifest.get("foreign_unit_ids", {}) or {}
+            local_dfs = {
+                "powerplant_units": powerplant_units,
+                "storage_units": storage_units,
+                "demand_units": demand_units,
+            }
+            for ut_name in ("powerplant_units", "storage_units", "demand_units"):
+                local_df = local_dfs[ut_name]
+                local_index = (
+                    set(local_df.index.astype(str)) if local_df is not None else set()
+                )
+                for uid in manifest_foreign.get(ut_name, []) or []:
+                    uid = str(uid)
+                    if uid not in local_index:
+                        raise ValueError(
+                            f"foreign_units.json lists foreign unit '{uid}' of type "
+                            f"'{ut_name}', but it was not found among the loaded "
+                            f"{ut_name} in '{path}'. The superset folder is out of "
+                            "sync with its manifest; regenerate it."
+                        )
+                    foreign_unit_ids[ut_name].append(uid)
 
     if powerplant_units is None or demand_units is None:
         raise ValueError("No power plant or no demand units were provided!")
@@ -811,12 +844,14 @@ def load_config_and_create_forecaster(
 
     # Force foreign-scenario units to availability=0 and (for demand) demand=0
     # so they remain registered/dispatchable but contribute nothing to clearing.
+    # ``foreign_unit_ids`` is populated either from paired-training ``extra_units``
+    # or from a ``foreign_units.json`` manifest in a standalone ``_superset`` run.
     all_foreign_ids: list[str] = (
         foreign_unit_ids["powerplant_units"]
         + foreign_unit_ids["storage_units"]
         + foreign_unit_ids["demand_units"]
     )
-    if extra_units:
+    if all_foreign_ids:
         for uid in all_foreign_ids:
             availability[uid] = 0.0
         for uid in foreign_unit_ids["demand_units"]:
@@ -1306,6 +1341,14 @@ def build_staggered_supersets(
     each scenario derives the set of *foreign* rows that must be merged in so the
     union of registered RL agents is identical across both worlds.
 
+    As a side effect, a self-contained ``_superset`` subfolder is written next to
+    each scenario. It contains the union unit CSVs, a copy of every other input
+    file (``config.yaml``, profile CSVs, ...), and a ``foreign_units.json``
+    manifest naming the foreign unit ids. That folder can be run standalone in
+    non-learning mode with the learned policies; the loader reads the manifest
+    and forces the foreign units to zero output. See
+    :func:`run_staggered_evaluation`.
+
     Args:
         scenario_paths: Filesystem paths to the scenario folders (each containing
             ``config.yaml`` and the unit CSVs).
@@ -1356,10 +1399,21 @@ def build_staggered_supersets(
             )
         extra_units_per_scenario[sp] = extras
 
-        # Optionally write _superset/ CSVs alongside the scenario for inspection.
+        # Materialise a self-contained, directly-runnable ``_superset`` scenario
+        # folder alongside each scenario. It contains the union unit CSVs plus a
+        # ``foreign_units.json`` manifest naming the foreign ids, and a copy of
+        # every other input file (config.yaml, profiles, ...) so the folder can be
+        # run in non-learning mode with the learned policies via the standard
+        # loader. The loader reads the manifest and forces the foreign units to
+        # zero output (availability=0 / demand=0) — see
+        # ``load_config_and_create_forecaster``.
         try:
             superset_dir = Path(sp) / "_superset"
             superset_dir.mkdir(exist_ok=True)
+
+            unit_csv_names = {f"{ut}.csv" for ut in UNIT_TYPES}
+
+            # 1) Write the union unit CSVs.
             for ut in UNIT_TYPES:
                 local_df = local_dfs[ut]
                 merged = (
@@ -1373,8 +1427,31 @@ def build_staggered_supersets(
                 )
                 if merged is not None:
                     merged.to_csv(superset_dir / f"{ut}.csv")
+
+            # 2) Copy every other input file (config.yaml, profile CSVs, license
+            #    sidecars, ...) so the folder is self-contained. The union unit
+            #    CSVs written above are not overwritten.
+            for entry in Path(sp).iterdir():
+                if entry.is_dir():
+                    continue
+                if entry.name in unit_csv_names:
+                    continue
+                shutil.copy2(entry, superset_dir / entry.name)
+
+            # 3) Write the foreign-unit manifest read back by the loader.
+            manifest = {
+                "version": 1,
+                "scenario": Path(sp).name,
+                "foreign_unit_ids": {
+                    ut: [str(uid) for uid in extras[ut].index]
+                    for ut in UNIT_TYPES
+                    if not extras[ut].empty
+                },
+            }
+            with open(superset_dir / "foreign_units.json", "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
         except OSError as e:  # pragma: no cover — non-fatal, inspection-only
-            logger.warning(f"Could not write _superset CSVs to {sp}: {e}")
+            logger.warning(f"Could not write _superset folder to {sp}: {e}")
 
     return local_ids, extra_units_per_scenario
 
@@ -2082,6 +2159,119 @@ def run_staggered_learning(
     )
     trainer.run()
     return world_a, world_b
+
+
+def run_staggered_evaluation(
+    inputs_path: str,
+    scenario: str,
+    study_case: str,
+    trained_policies_path: str | None = None,
+    db_uri: str = "",
+    export_csv_path: str = "",
+    log_level: str = "INFO",
+) -> tuple[World, ...]:
+    """Run the staggered ``_superset`` scenarios in non-learning mode with learned policies.
+
+    Convenience wrapper around the manifest-driven superset mechanism. It
+    (re)builds the cross-scenario ``_superset`` folders (so the union unit CSVs
+    and ``foreign_units.json`` manifests are current), then loads and runs each
+    superset folder as a standalone, non-learning simulation that loads the
+    shared trained policy. Foreign generators (those native to the *other*
+    paired scenario) are forced to zero output via the manifest, so each world
+    reflects only its own native units while still presenting the full RL agent
+    set the shared policy was trained on.
+
+    Args:
+        inputs_path: Path to the inputs root (containing scenario folders).
+        scenario: Primary scenario folder name (declares the ``staggered_training`` block).
+        study_case: Study case key inside the primary scenario's ``config.yaml``.
+        trained_policies_path: Directory of saved policies to load (the shared
+            policy is the same for every paired world). When ``None``, defaults
+            to ``<anchor_scenario>/learned_strategies/<anchor>_<study_case>/last_policies``.
+        db_uri: SQLAlchemy DB URI for the worlds (optional).
+        export_csv_path: CSV output path (optional).
+        log_level: Log level forwarded to ``World``.
+
+    Returns:
+        Tuple of the evaluated ``World`` instances (one per paired scenario).
+    """
+    # Resolve the paired scenarios from the primary config's staggered block.
+    primary_path = Path(f"{inputs_path}/{scenario}")
+    with open(primary_path / "config.yaml") as f:
+        primary_config = yaml.safe_load(f)
+    if not study_case:
+        study_case = list(primary_config.keys())[0]
+    primary_config = primary_config[study_case]
+    learning_config = primary_config.get("learning_config", {}) or {}
+    staggered = learning_config.get("staggered_training", {}) or {}
+    if not staggered.get("enabled"):
+        raise ValueError(
+            "run_staggered_evaluation called but "
+            "'learning_config.staggered_training.enabled' is not true."
+        )
+    scenarios = staggered.get("scenarios", [])
+    if len(scenarios) < 2:
+        raise ValueError(
+            "learning_config.staggered_training.scenarios must list at least 2 scenarios."
+        )
+
+    scenario_paths: list[str] = []
+    for s in scenarios:
+        p = Path(s["path"])
+        if not p.is_absolute():
+            p = (primary_path / p).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Staggered scenario path does not exist: {p}")
+        scenario_paths.append(str(p))
+
+    # (Re)build the supersets so the _superset folders + manifests are current.
+    build_staggered_supersets(scenario_paths)
+
+    # The shared policy is saved once under the anchor (first) scenario during
+    # training; every eval world loads from that same absolute path.
+    anchor_path = Path(scenario_paths[0])
+    default_policy_path = str(
+        anchor_path
+        / "learned_strategies"
+        / f"{anchor_path.name}_{study_case}"
+        / "last_policies"
+    )
+    policy_path = trained_policies_path or default_policy_path
+
+    worlds: list[World] = []
+    for sp in scenario_paths:
+        sp_path = Path(sp)
+
+        # Discover the study case inside the copied superset config.
+        with open(sp_path / "_superset" / "config.yaml") as f:
+            sc_config = yaml.safe_load(f)
+        sc_study_case = (
+            study_case if study_case in sc_config else list(sc_config.keys())[0]
+        )
+
+        world = World(
+            database_uri=db_uri,
+            export_csv_path=export_csv_path,
+            log_level=log_level,
+        )
+        # Loads the union units and neutralises foreign units via the manifest.
+        world.scenario_data = load_config_and_create_forecaster(
+            str(sp_path), "_superset", sc_study_case
+        )
+
+        # Namespace the simulation id by the scenario folder so DB rows from the
+        # paired worlds (and from training) stay separable.
+        world.scenario_data["simulation_id"] = f"{sp_path.name}_eval"
+
+        lc = world.scenario_data["config"].setdefault("learning_config", {})
+        lc["trained_policies_load_path"] = policy_path
+
+        # Non-learning run with the loaded shared policy.
+        setup_world(world=world, terminate_learning=True)
+        world.run()
+        worlds.append(world)
+
+    return tuple(worlds)
 
 
 if __name__ == "__main__":

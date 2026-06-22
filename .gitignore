@@ -143,6 +143,7 @@ learned_strategies
 examples/outputs
 assume-repo
 tensorboard
+_superset/
 
 examples/notebooks/inputs
 examples/notebooks/outputs

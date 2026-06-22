@@ -88,7 +88,9 @@ fleet, demand profiles, or fuel prices. Any unit that exists only in one
 scenario is automatically injected into the other world with
 ``availability = 0`` (powerplants/storages) or ``demand = 0`` (demand
 units), so it cannot bid. This guarantees both worlds register the **same
-agent set** while remaining structurally distinct.
+agent set** while remaining structurally distinct. The same neutralisation
+is reused when evaluating the trained policy — see
+`Running the superset in non-learning mode with learned policies`_.
 
 How to run
 ==========
@@ -137,6 +139,101 @@ across both worlds; per-scenario averages are emitted alongside as
 A single shared policy is saved to the ``trained_policies_save_path``
 declared in the primary scenario, just as for ordinary single-world
 training.
+
+The superset scenario folder
+============================
+
+During loading, the union of all units across both scenarios — the
+**superset** — is computed so each world registers the same RL agent set.
+As a side effect, :func:`assume.scenario.loader_csv.build_staggered_supersets`
+also materialises a self-contained, directly-runnable ``_superset`` folder
+inside each scenario directory:
+
+.. code-block:: text
+
+    examples/inputs/staggered_bau/
+    └── _superset/
+        ├── config.yaml              # copied from the scenario
+        ├── powerplant_units.csv     # union of both scenarios' units
+        ├── storage_units.csv        # union
+        ├── demand_units.csv         # union
+        ├── demand_df.csv            # copies of all other input files
+        ├── ...                      # (profiles, fuel prices, .license, ...)
+        └── foreign_units.json       # manifest of the foreign unit ids
+
+The unit CSVs hold the **union** of both scenarios' units, so the folder
+presents the full agent set the shared policy was trained on. The
+``foreign_units.json`` manifest records which of those units are
+*foreign* — i.e. native to the *other* paired scenario — so they can be
+neutralised when the folder is run on its own:
+
+.. code-block:: json
+
+    {
+      "version": 1,
+      "scenario": "staggered_bau",
+      "foreign_unit_ids": {
+        "powerplant_units": ["pp_inv_only"],
+        "demand_units": ["demand_inv_only"]
+      }
+    }
+
+.. note::
+
+   The ``_superset`` folders are regenerated on every training run and are
+   git-ignored. They are not edited by hand; treat them as build artefacts.
+
+Running the superset in non-learning mode with learned policies
+===============================================================
+
+To evaluate the trained policy you run the ``_superset`` folder as an
+ordinary (non-learning) scenario that loads the saved policy. Because the
+unit CSVs contain the **union** of both fleets, the foreign generators
+would otherwise dispatch at full capacity and pollute the clearing. To
+prevent this, the loader reads ``foreign_units.json`` and forces every
+foreign unit to **zero output** for the entire horizon — exactly the same
+neutralisation applied during paired training:
+
+* foreign powerplants and storages → ``availability = 0`` (cannot dispatch);
+* foreign demand units → ``demand = 0`` (no load contribution);
+* every foreign unit's forecaster is flagged ``is_foreign = True``.
+
+Native units are untouched, so each superset world reflects only its own
+fleet while still registering the complete agent set the shared policy
+expects. If the manifest references a unit id that is **not** present in
+the loaded CSVs, the loader raises a ``ValueError`` (the folder is out of
+sync with its manifest and should be regenerated).
+
+The convenience helper
+:func:`assume.scenario.loader_csv.run_staggered_evaluation` wires this up
+for both scenarios in one call. It rebuilds the supersets, loads each
+``_superset`` folder, points it at the shared trained policy, and runs it
+in non-learning mode:
+
+.. code-block:: python
+
+    from assume.scenario.loader_csv import run_staggered_evaluation
+
+    run_staggered_evaluation(
+        inputs_path="examples/inputs",
+        scenario="staggered_bau",          # the primary scenario folder
+        study_case="staggered",
+        # defaults to the anchor scenario's last_policies if omitted:
+        trained_policies_path=None,
+        db_uri="sqlite:///examples/local_db/assume_staggered_eval.db",
+        export_csv_path="examples/outputs/staggered_eval",
+    )
+
+Each evaluated world's ``simulation_id`` is namespaced ``<scenario>_eval``
+(e.g. ``staggered_bau_eval`` / ``staggered_inv_eval``) so its outputs stay
+separable from the training rows. The same shared policy is loaded by every
+paired world; by default it is read from
+``<anchor>/learned_strategies/<anchor>_<study_case>/last_policies``. Pass
+``trained_policies_path`` explicitly if your policy was saved elsewhere.
+
+Alternatively, because the ``_superset`` folder is self-contained, you can
+point the standard loader or the ``assume`` CLI directly at it — the
+foreign-unit neutralisation happens automatically via the manifest.
 
 Acceptance criteria the loader enforces
 =======================================
