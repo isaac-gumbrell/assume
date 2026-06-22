@@ -105,11 +105,19 @@ def _share_learning_state(anchor: World, secondary: World) -> None:
     # Replace each secondary-world strategy's actor with the anchor's so both
     # worlds query the same network for actions. We mutate the strategy
     # instance in place because units already hold references to it.
+    #
+    # ``action_noise`` is shared too: the exploration-noise decay schedule is
+    # only applied to ``anchor_role.rl_strats`` during ``update_policy`` (the
+    # shared algorithm always references the anchor's learning role). If each
+    # world kept its own noise object, the secondary's noise would never decay
+    # and it would inject maximally-noisy transitions into the shared buffer for
+    # the entire run. Sharing the object keeps both worlds on the same decaying
+    # schedule.
     for unit_id, secondary_strategy in secondary_role.rl_strats.items():
         if unit_id not in anchor_role.rl_strats:
             continue
         anchor_strategy = anchor_role.rl_strats[unit_id]
-        for attr in ("actor", "actor_target", "target_actor"):
+        for attr in ("actor", "actor_target", "target_actor", "action_noise"):
             if hasattr(anchor_strategy, attr):
                 setattr(secondary_strategy, attr, getattr(anchor_strategy, attr))
 
