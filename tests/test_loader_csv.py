@@ -197,7 +197,7 @@ def test_forecast_interface__save_forecasts():
 
 
 def test_load_srmc_congestion_from_db():
-    """load_srmc_congestion_from_db pivots grid_flows rows into *_congestion_signal columns."""
+    """load_srmc_congestion_from_db pivots grid_flows rows into congestion_{line_id} columns."""
     import tempfile
 
     from sqlalchemy import create_engine
@@ -261,11 +261,11 @@ def test_load_srmc_congestion_from_db():
 
     result = load_srmc_congestion_from_db(db_uri, "srmc_run", index)
 
-    assert set(result.columns) == {"L1_congestion_signal", "L2_congestion_signal"}
+    assert set(result.columns) == {"congestion_L1", "congestion_L2"}
     assert len(result) == 3
     assert result.index.equals(index)
-    assert pytest.approx(result["L1_congestion_signal"].tolist()) == [0.2, 0.4, 0.6]
-    assert pytest.approx(result["L2_congestion_signal"].tolist()) == [0.1, 0.1, 0.1]
+    assert pytest.approx(result["congestion_L1"].tolist()) == [0.2, 0.4, 0.6]
+    assert pytest.approx(result["congestion_L2"].tolist()) == [0.1, 0.1, 0.1]
 
     # Clean up temp file
     import os

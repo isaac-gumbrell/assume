@@ -303,7 +303,7 @@ class UnitForecaster:
             - ``price`` (``price_naive_forecast``)
             - ``residual_load`` (``residual_load_naive_forecast``)
             - ``congestion_signal_lines`` (``congestion_signal_lines_from_df``): uses
-              ``congestion_*`` or ``*_congestion_signal`` columns from *forecast_df*;
+              ``congestion_*`` columns from *forecast_df*;
               returns ``{}`` (zero observations) when no matching columns are present.
               Use ``congestion_signal_line_naive_forecast`` to compute from physics instead.
 

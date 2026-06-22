@@ -484,7 +484,7 @@ def load_srmc_congestion_from_db(
         index:         The DatetimeIndex of the current scenario.
 
     Returns:
-        DataFrame with columns ``{line_id}_congestion_signal`` indexed by datetime,
+        DataFrame with columns ``congestion_{line_id}`` indexed by datetime,
         or an empty DataFrame (with the correct *index*) when the table/column is
         missing or the simulation is not found.
     """
@@ -756,7 +756,7 @@ def load_config_and_create_forecaster(
     )
 
     # If an SRMC pre-run simulation is specified, load its congestion_pct signals
-    # from the DB and merge them as {line_id}_congestion_signal columns into forecasts_df.
+    # from the DB and merge them as congestion_{line_id} columns into forecasts_df.
     srmc_sim_id = config.get("srmc_congestion_simulation_id")
     if srmc_sim_id:
         db_uri = config.get("db_uri")
