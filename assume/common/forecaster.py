@@ -203,6 +203,14 @@ class UnitForecaster:
         )
         self.preprocess_information = {}
         self.congestion_signal_lines: dict[str, FastSeries] = {}
+        # True when this unit belongs to the *other* scenario in staggered
+        # (paired-scenario) training. Foreign units are registered as part of the
+        # shared agent superset but forced inactive (availability=0) so they never
+        # influence clearing. Their transitions must be masked out of the shared
+        # MATD3 gradient - distinct from a *native* unit that merely happens to have
+        # zero availability this period (e.g. solar at night), which is a genuine,
+        # learnable state.
+        self.is_foreign: bool = False
 
     def _to_series(self, item: ForecastSeries) -> FastSeries:
         """Wrap *item* in a ``FastSeries`` aligned to ``self.index`` (no-op if already one)."""

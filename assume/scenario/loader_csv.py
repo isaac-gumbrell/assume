@@ -811,12 +811,12 @@ def load_config_and_create_forecaster(
 
     # Force foreign-scenario units to availability=0 and (for demand) demand=0
     # so they remain registered/dispatchable but contribute nothing to clearing.
+    all_foreign_ids: list[str] = (
+        foreign_unit_ids["powerplant_units"]
+        + foreign_unit_ids["storage_units"]
+        + foreign_unit_ids["demand_units"]
+    )
     if extra_units:
-        all_foreign_ids = (
-            foreign_unit_ids["powerplant_units"]
-            + foreign_unit_ids["storage_units"]
-            + foreign_unit_ids["demand_units"]
-        )
         for uid in all_foreign_ids:
             availability[uid] = 0.0
         for uid in foreign_unit_ids["demand_units"]:
@@ -961,6 +961,13 @@ def load_config_and_create_forecaster(
                         thermal_storage_schedule=0,  # TODO
                         thermal_demand=0,  # TODO
                     )
+    # Mark foreign units so their (forced-off) transitions can be masked out of the
+    # shared MATD3 gradient without conflating them with native units that merely have
+    # zero availability this period (e.g. solar at night).
+    for uid in all_foreign_ids:
+        if uid in unit_forecasts:
+            unit_forecasts[uid].is_foreign = True
+
     return {
         "config": config,
         "simulation_id": simulation_id,

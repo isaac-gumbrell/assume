@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 from datetime import datetime
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -17,6 +18,7 @@ try:
         EnergyLearningSingleBidStrategyCongestion,
         EnergyLearningStrategy,
         EnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
         StorageEnergyLearningStrategyCongestion,
     )
@@ -27,6 +29,7 @@ except ImportError:
     EnergyLearningStrategyCongestion = None
     EnergyLearningSingleBidStrategyCongestion = None
     StorageEnergyLearningStrategyCongestion = None
+    RenewableEnergyLearningCompatibleStrategy = None
     RenewableEnergyLearningSingleBidStrategyCongestion = None
 
 from assume.units import PowerPlant
@@ -340,3 +343,112 @@ def test_congestion_line_order_stability():
     assert list(s1.congestion_line_obs.keys()) == sorted(
         ff.congestion_signal_lines.keys()
     )
+
+
+# ---------------------------------------------------------------------------
+# Activity-mask conflation regression (commit 88ac62d, Tier 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.require_learning
+def test_activity_mask_keys_off_foreign_flag_not_availability(
+    mock_market_config,
+):
+    """The training mask must key off "is foreign", not zero availability.
+
+    The activity mask added in commit 88ac62d originally derived ``active`` from
+    ``unit.forecaster.availability.at[start] > 0``. That predicate was meant to
+    exclude *foreign* units (the paired scenario's superset, forced to
+    availability=0 for the whole horizon) from the shared MATD3 gradient, but it
+    also masked a *native* renewable's legitimate zero-availability hours (solar at
+    night, wind in a lull) - real, informative states the policy must learn from.
+
+    The fix keys the mask off ``unit.forecaster.is_foreign`` instead. This test
+    asserts the corrected behaviour:
+
+    - a native unit (``is_foreign=False``) stays active (1.0) in *both* its
+      generating hour and its own zero-availability hour, and
+    - a foreign unit (``is_foreign=True``) is masked out (0.0).
+    """
+    unit_id = "test_renewable"
+
+    index = pd.date_range("2023-06-30 22:00:00", periods=48, freq="h")
+    ff = PowerplantForecaster(
+        index,
+        fuel_prices={"lignite": 10, "co2": 10},
+        residual_load={"EOM": 0},
+    )
+
+    # A native renewable: available mid-day, genuinely off overnight.
+    active_start = pd.Timestamp("2023-07-01 12:00:00")
+    off_start = pd.Timestamp("2023-07-01 01:00:00")
+    ff.availability.at[off_start] = 0.0
+    assert ff.availability.at[active_start] == 1.0
+    assert ff.is_foreign is False
+
+    config = LearningConfig(
+        algorithm="matd3",
+        learning_mode=True,
+        training_episodes=3,
+        max_bid_price=100,
+    )
+    lr = Learning(config, start, end)
+    strategy = RenewableEnergyLearningCompatibleStrategy(
+        unit_id=unit_id,
+        learning_config=config,
+        learning_role=lr,
+    )
+
+    power_plant = PowerPlant(
+        id=unit_id,
+        unit_operator="test_operator",
+        technology="solar",
+        index=ff.index,
+        max_power=100,
+        min_power=0,
+        efficiency=1.0,
+        additional_cost=0,
+        bidding_strategies={"EOM": strategy},
+        fuel_type="lignite",
+        emission_factor=0.0,
+        forecaster=ff,
+    )
+
+    def _orderbook(t_start, volume):
+        return [
+            {
+                "start_time": t_start,
+                "end_time": t_start + pd.Timedelta(hours=1),
+                "only_hours": None,
+                "volume": volume,
+                "accepted_volume": volume,
+                "accepted_price": 50.0,
+                "node": "node0",
+            }
+        ]
+
+    mc = mock_market_config
+    mc.market_id = "EOM"
+    mc.product_type = "energy"
+
+    with patch.object(PowerPlant, "calculate_marginal_cost", return_value=0.0):
+        # Generating hour (availability=1): offered full capacity, dispatched.
+        strategy.calculate_reward(
+            power_plant, mc, orderbook=_orderbook(active_start, 100.0)
+        )
+        # Night hour (availability=0): nothing offered, nothing dispatched.
+        strategy.calculate_reward(power_plant, mc, orderbook=_orderbook(off_start, 0.0))
+
+    # A native (non-foreign) unit is trainable in both hours - its own
+    # zero-availability hour is a genuine, learnable state.
+    assert lr.all_active[active_start][unit_id][0] == 1.0
+    assert lr.all_active[off_start][unit_id][0] == 1.0
+
+    # A foreign unit (forced off for the whole horizon) is masked out, regardless
+    # of which hour we evaluate. (The cache appends, so check the latest entry.)
+    ff.is_foreign = True
+    with patch.object(PowerPlant, "calculate_marginal_cost", return_value=0.0):
+        strategy.calculate_reward(
+            power_plant, mc, orderbook=_orderbook(active_start, 100.0)
+        )
+    assert lr.all_active[active_start][unit_id][-1] == 0.0

@@ -650,12 +650,16 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         profit_scale = 1
         profit = min(profit, profit_scale * abs(profit))
 
-        # Available capacity actually offered this period (availability-adjusted via
-        # calculate_min_max_power). Using this instead of nameplate ``unit.max_power``
-        # avoids penalising a unit for capacity it is physically unable to provide,
-        # e.g. a foreign unit forced off (availability=0) in staggered training, which
-        # would otherwise receive a spurious negative reward and poison the policy.
-        available_power = offered_volume_total
+        # Opportunity-cost reference: nameplate capacity scaled by availability.
+        # This must be an *exogenous* baseline. ``offered_volume_total`` (the residual
+        # headroom returned by calculate_min_max_power) is endogenous - it already nets
+        # out the unit's own committed dispatch and reserve, so using it lets the agent
+        # shrink its own regret penalty by withholding, collapsing the opportunity-cost
+        # signal. availability=1 reproduces the original nameplate baseline exactly,
+        # while availability=0 forces a forced-off unit's opportunity cost (and reward)
+        # to 0 without poisoning the shared policy.
+        availability = unit.forecaster.availability.at[start]
+        available_power = availability * unit.max_power
 
         # Opportunity cost: The income lost due to not operating at full capacity.
         opportunity_cost = (
@@ -682,9 +686,11 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         regret = regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
-        # A unit that was forced off (no available capacity) cannot influence the
-        # market this period, so its transition carries no learning signal.
-        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+        # Foreign units (the paired scenario's superset, forced off for staggered
+        # training) carry no learning signal and are masked out of the shared policy
+        # update. A *native* unit with zero availability this period (e.g. solar at
+        # night) is a genuine, learnable state and must stay active.
+        active = 0.0 if unit.forecaster.is_foreign else 1.0
 
         # Store results in unit outputs
         # Note: these are not learning-specific results but stored for all units for analysis
@@ -1098,9 +1104,11 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         unit.outputs["profit"].loc[start:end_excl] += profit
         unit.outputs["total_costs"].loc[start:end_excl] += order_cost
 
-        # A unit forced off (availability=0) cannot act this period, so its transition
-        # carries no learning signal and is masked out of the policy update.
-        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+        # Foreign units (the paired scenario's superset, forced off for staggered
+        # training) carry no learning signal and are masked out of the shared policy
+        # update. A *native* unit with zero availability this period (e.g. solar at
+        # night) is a genuine, learnable state and must stay active.
+        active = 0.0 if unit.forecaster.is_foreign else 1.0
 
         # write rl-rewards to buffer
         if self.learning_mode:
@@ -1338,9 +1346,11 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         regret = regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
-        # A unit forced off (availability=0) cannot act this period, so its transition
-        # carries no learning signal and is masked out of the policy update.
-        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+        # Foreign units (the paired scenario's superset, forced off for staggered
+        # training) carry no learning signal and are masked out of the shared policy
+        # update. A *native* unit with zero availability this period (e.g. solar at
+        # night) is a genuine, learnable state and must stay active.
+        active = 0.0 if unit.forecaster.is_foreign else 1.0
 
         # Store results in unit outputs
         # Note: these are not learning-specific results but stored for all units for analysis
@@ -1599,9 +1609,11 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         regret = 0
         reward = scaling * (profit - regret)
 
-        # A unit forced off (availability=0) cannot act this period, so its transition
-        # carries no learning signal and is masked out of the policy update.
-        active = 1.0 if unit.forecaster.availability.at[start] > 0 else 0.0
+        # Foreign units (the paired scenario's superset, forced off for staggered
+        # training) carry no learning signal and are masked out of the shared policy
+        # update. A *native* unit with zero availability this period (e.g. solar at
+        # night) is a genuine, learnable state and must stay active.
+        active = 0.0 if unit.forecaster.is_foreign else 1.0
 
         unit.outputs["profit"].loc[start:end_excl] += profit
         unit.outputs["total_costs"].loc[start:end_excl] += operational_cost
