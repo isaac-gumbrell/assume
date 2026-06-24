@@ -58,6 +58,12 @@ class Learning(Role):
         self.rl_strats: dict[int, LearningStrategy] = {}
         self.learning_config = learning_config
         self.critics = {}
+        # Clock (epoch seconds) of the world currently producing experience.
+        # Set just before each policy update so the LR/noise schedule tracks
+        # real progress even when this role's own context clock is stale, as
+        # happens for the shared anchor role in staggered training. ``None``
+        # means "use this role's own context" (normal single-world training).
+        self._progress_timestamp: float | None = None
         self.target_critics = {}
 
         device = "cpu"
@@ -328,6 +334,14 @@ class Learning(Role):
             self.episodes_done
             >= self.learning_config.episodes_collecting_initial_experience
         ):
+            # The world flushing here (``self``) is the one currently stepping.
+            # Hand its clock to the (possibly shared) algorithm's learning role
+            # so the LR/noise schedule advances with real progress. In
+            # single-world training this is ``self`` and a no-op; in staggered
+            # training it overrides the anchor role's stale clock.
+            self.rl_algorithm.learning_role._progress_timestamp = (
+                self.context.current_timestamp
+            )
             self.rl_algorithm.update_policy()
 
     def add_observation_to_cache(self, unit_id, start, observation) -> None:
@@ -560,7 +574,31 @@ class Learning(Role):
 
         """
         total_duration = self.end - self.start
-        elapsed_duration = self.context.current_timestamp - self.start
+
+        # Use the clock of the world currently producing experience. In
+        # staggered (paired-scenario) training the shared algorithm's
+        # ``learning_role`` is the anchor world's role, whose ``context`` clock
+        # can be stale (e.g. read 0) while the secondary world is stepping.
+        # ``_progress_timestamp`` is set to the stepping world's clock just
+        # before each update (see ``_store_to_buffer_and_update_sync``) so the
+        # within-episode ramp tracks real progress; it falls back to this
+        # role's own context for normal single-world training.
+        current_timestamp = (
+            self._progress_timestamp
+            if self._progress_timestamp is not None
+            else self.context.current_timestamp
+        )
+        elapsed_duration = current_timestamp - self.start
+
+        # Fraction of the current episode that has elapsed. Clamp defensively
+        # so any unexpected out-of-range clock can never push
+        # ``progress_remaining`` outside ``[0, 1]`` and blow up the
+        # learning-rate / noise schedules.
+        if total_duration > 0:
+            within_episode_fraction = elapsed_duration / total_duration
+        else:
+            within_episode_fraction = 0.0
+        within_episode_fraction = min(max(within_episode_fraction, 0.0), 1.0)
 
         learning_episodes = (
             self.learning_config.training_episodes
@@ -582,7 +620,7 @@ class Learning(Role):
                     )
                     / learning_episodes
                 )
-                - ((1 / learning_episodes) * (elapsed_duration / total_duration))
+                - ((1 / learning_episodes) * within_episode_fraction)
             )
 
         return progress_remaining
