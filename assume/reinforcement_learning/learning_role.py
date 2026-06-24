@@ -22,6 +22,7 @@ from assume.common.utils import (
 from assume.reinforcement_learning.algorithms.base_algorithm import RLAlgorithm
 from assume.reinforcement_learning.algorithms.matd3 import TD3
 from assume.reinforcement_learning.buffer import ReplayBuffer
+from assume.reinforcement_learning.debug_diagnostics import is_enabled, log_row
 from assume.reinforcement_learning.learning_utils import (
     linear_schedule_func,
     transform_buffer_data,
@@ -380,6 +381,20 @@ class Learning(Role):
         self.all_profits[start][unit_id].append(profit)
         self.all_active[start][unit_id].append(active)
 
+        # Opt-in divergence diagnostics (no-op unless ASSUME_RL_DEBUG is set).
+        # Confirms reward magnitude and tracks regret growth over training.
+        if is_enabled():
+            log_row(
+                "rewards",
+                episode=self.episodes_done,
+                start=str(start),
+                unit_id=unit_id,
+                reward=float(reward),
+                regret=float(regret),
+                profit=float(profit),
+                active=float(active),
+            )
+
     def load_inter_episodic_data(self, inter_episodic_data):
         """
         Load the inter-episodic data from the dict stored across simulation runs.
@@ -562,6 +577,18 @@ class Learning(Role):
         total_duration = self.end - self.start
         elapsed_duration = self.context.current_timestamp - self.start
 
+        # Fraction of the current episode that has elapsed. The world clock must
+        # lie within ``[start, end]``; clamp defensively so a stale or unset
+        # clock (e.g. the shared learning role in staggered training, whose
+        # ``context`` belongs to the anchor world and can read 0 while the
+        # secondary world is stepping) can never push ``progress_remaining``
+        # outside ``[0, 1]`` and blow up the learning-rate / noise schedules.
+        if total_duration > 0:
+            within_episode_fraction = elapsed_duration / total_duration
+        else:
+            within_episode_fraction = 0.0
+        within_episode_fraction = min(max(within_episode_fraction, 0.0), 1.0)
+
         learning_episodes = (
             self.learning_config.training_episodes
             - self.learning_config.episodes_collecting_initial_experience
@@ -582,7 +609,7 @@ class Learning(Role):
                     )
                     / learning_episodes
                 )
-                - ((1 / learning_episodes) * (elapsed_duration / total_duration))
+                - ((1 / learning_episodes) * within_episode_fraction)
             )
 
         return progress_remaining

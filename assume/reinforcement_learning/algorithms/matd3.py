@@ -10,6 +10,7 @@ import torch as th
 from torch.optim import AdamW
 
 from assume.reinforcement_learning.algorithms.base_algorithm import RLAlgorithm
+from assume.reinforcement_learning.debug_diagnostics import is_enabled, log_row
 from assume.reinforcement_learning.learning_utils import (
     polyak_update,
     transfer_weights,
@@ -540,6 +541,57 @@ class TD3(RLAlgorithm):
             # from each agent's own critic/actor loss so they do not bias the policy.
             masks = transitions.masks
 
+            # Opt-in divergence diagnostics (no-op unless ASSUME_RL_DEBUG is set).
+            diag = is_enabled()
+            if diag:
+                # Per-agent active sample count and action magnitude. Agents that
+                # are fully inactive across the batch are "foreign" (forced off);
+                # their stale actions still enter the centralized critic input via
+                # ``all_actions``/``next_actions`` even though their own loss is
+                # masked — quantify that contamination here.
+                agent_active = masks.sum(dim=0)  # (n_rl_agents,)
+                action_absmean = actions.abs().mean(dim=(0, 2))  # (n_rl_agents,)
+                inactive = agent_active == 0
+                n_inactive = int(inactive.sum().item())
+                # Per-agent observation magnitude, split by foreign (fully
+                # inactive) vs native, and a NaN/Inf scan of the sampled batch.
+                # An unbounded observation (e.g. min_max_scale returning raw
+                # values for a constant forecast) entering the centralized critic
+                # input is a prime suspect for the one-step critic explosion.
+                obs_absmax_per_agent = states.abs().amax(dim=(0, 2))  # (n_rl_agents,)
+                batch_bad = int(
+                    th.isnan(states).any().item() or th.isinf(states).any().item()
+                ) + int(
+                    th.isnan(actions).any().item() or th.isinf(actions).any().item()
+                )
+                log_row(
+                    "step_masks",
+                    n_updates=self.n_updates,
+                    n_agents=int(n_rl_agents),
+                    n_fully_inactive=n_inactive,
+                    inactive_action_absmean=(
+                        float(action_absmean[inactive].mean().item())
+                        if n_inactive
+                        else 0.0
+                    ),
+                    active_action_absmean=(
+                        float(action_absmean[~inactive].mean().item())
+                        if n_inactive < n_rl_agents
+                        else 0.0
+                    ),
+                    obs_absmax_foreign=(
+                        float(obs_absmax_per_agent[inactive].max().item())
+                        if n_inactive
+                        else 0.0
+                    ),
+                    obs_absmax_native=(
+                        float(obs_absmax_per_agent[~inactive].max().item())
+                        if n_inactive < n_rl_agents
+                        else 0.0
+                    ),
+                    batch_obs_or_action_naninf=batch_bad,
+                )
+
             with th.no_grad():
                 # Select action according to policy and add clipped noise
                 noise = (
@@ -649,6 +701,26 @@ class TD3(RLAlgorithm):
                 unit_params[step][strategy.unit_id]["critic_loss"] = critic_loss.item()
                 total_critic_loss += critic_loss
 
+                # Opt-in diagnostics: track target-Q drift (root cause of a
+                # climbing critic loss) and active sample count per agent.
+                if diag:
+                    log_row(
+                        "critic_updates",
+                        n_updates=self.n_updates,
+                        agent=strategy.unit_id,
+                        active_count=float(mask_i.sum().item()),
+                        target_q_absmean=float(target_Q_values.abs().mean().item()),
+                        next_q_absmax=float(next_q_values.abs().max().item()),
+                        current_q_absmean=float(
+                            th.stack(
+                                [q.detach().abs().mean() for q in current_Q_values]
+                            )
+                            .mean()
+                            .item()
+                        ),
+                        critic_loss=float(critic_loss.item()),
+                    )
+
             # Single backward pass for all agents' critics
             total_critic_loss.backward()
 
@@ -663,7 +735,29 @@ class TD3(RLAlgorithm):
                 total_norm = th.nn.utils.clip_grad_norm_(
                     parameters, max_norm=self.grad_clip_norm
                 )
+
                 strategy.critics.optimizer.step()
+
+                # Opt-in diagnostics: pre-clip gradient norm distinguishes an
+                # input-corruption explosion (loss/target already huge -> huge
+                # grad before clipping) from a path that clipping should have
+                # tamed. ``total_norm`` from clip_grad_norm_ is the PRE-clip norm.
+                if diag:
+                    log_row(
+                        "critic_grads",
+                        n_updates=self.n_updates,
+                        agent=strategy.unit_id,
+                        pre_clip_grad_norm=float(total_norm),
+                        pre_clip_max_param_grad_norm=float(max_grad_norm),
+                        clip_threshold=float(self.grad_clip_norm),
+                        grad_has_naninf=int(
+                            any(
+                                th.isnan(p.grad).any().item()
+                                or th.isinf(p.grad).any().item()
+                                for p in parameters
+                            )
+                        ),
+                    )
 
                 # Store clipping statistics
                 unit_params[step][strategy.unit_id]["critic_total_grad_norm"] = (
@@ -732,6 +826,16 @@ class TD3(RLAlgorithm):
                     )
                     # Accumulate actor losses
                     total_actor_loss += actor_loss
+
+                    # Opt-in diagnostics: actor loss and active sample count.
+                    if diag:
+                        log_row(
+                            "actor_updates",
+                            n_updates=self.n_updates,
+                            agent=strategy.unit_id,
+                            active_count=float(mask_i.sum().item()),
+                            actor_loss=float(actor_loss.item()),
+                        )
 
                 # Single backward pass for all actors
                 total_actor_loss.backward()
