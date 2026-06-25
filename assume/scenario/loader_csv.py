@@ -1829,6 +1829,29 @@ def run_learning(
     default_buffer_path = f"{save_path}/last_policies/replay_buffer.npz"
     default_state_path = f"{save_path}/last_policies/learning_state.pt"
 
+    def persist_replay_buffer():
+        """Persist the replay buffer to disk alongside saved policies (configurable)."""
+        try:
+            if cfg_save_flag:
+                save_path_cfg = (
+                    cfg_save_path if cfg_save_path is not None else default_buffer_path
+                )
+                # ensure directory exists will be handled by ReplayBuffer.save
+                if (
+                    hasattr(world.learning_role, "buffer")
+                    and world.learning_role.buffer is not None
+                ):
+                    logger.info(f"Saving replay buffer to {save_path_cfg}")
+                    world.learning_role.buffer.save(save_path_cfg)
+                    if os.path.exists(save_path_cfg):
+                        logger.info(f"Replay buffer saved: {save_path_cfg}")
+                    else:
+                        logger.warning(
+                            f"Replay buffer save attempted but file not found afterwards: {save_path_cfg}"
+                        )
+        except Exception:
+            logger.warning("Failed to save replay buffer")
+
     def resolve_checkpoint_path(
         load_path: str | None,
         save_path: str | None,
@@ -1983,6 +2006,13 @@ def run_learning(
         inter_episodic_data = world.learning_role.get_inter_episodic_data()
         inter_episodic_data["episodes_done"] = episode
 
+        # persist the replay buffer once the initial experience collection completes
+        if (
+            episode
+            == world.learning_role.learning_config.episodes_collecting_initial_experience
+        ):
+            persist_replay_buffer()
+
         # evaluation run:
         if (
             episode % validation_interval == 0
@@ -2042,28 +2072,7 @@ def run_learning(
                 directory=f"{world.learning_role.learning_config.trained_policies_save_path}/last_policies"
             )
             # also persist replay buffer alongside policies (configurable)
-            try:
-                if cfg_save_flag:
-                    save_path_cfg = (
-                        cfg_save_path
-                        if cfg_save_path is not None
-                        else default_buffer_path
-                    )
-                    # ensure directory exists will be handled by ReplayBuffer.save
-                    if (
-                        hasattr(world.learning_role, "buffer")
-                        and world.learning_role.buffer is not None
-                    ):
-                        logger.info(f"Saving replay buffer to {save_path_cfg}")
-                        world.learning_role.buffer.save(save_path_cfg)
-                        if os.path.exists(save_path_cfg):
-                            logger.info(f"Replay buffer saved: {save_path_cfg}")
-                        else:
-                            logger.warning(
-                                f"Replay buffer save attempted but file not found afterwards: {save_path_cfg}"
-                            )
-            except Exception:
-                logger.warning("Failed to save replay buffer")
+            persist_replay_buffer()
 
             try:
                 if cfg_state_save_flag:
