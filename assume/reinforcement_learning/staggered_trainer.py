@@ -483,6 +483,18 @@ class StaggeredTrainer:
         """
         for unit_id, sec_strat in self.secondary.learning_role.rl_strats.items():
             if unit_id not in self.anchor.learning_role.rl_strats:
+                # Both worlds load the same superset, so every secondary unit must
+                # exist on the anchor. A mismatch means the secondary would keep a
+                # diverged exploration state (and, more seriously, signals the
+                # superset/unit-id sets are out of sync between the paired worlds,
+                # which also scrambles the shared-buffer columns). Flag it loudly.
+                logger.warning(
+                    "Staggered exploration sync: secondary unit '%s' is not present "
+                    "in the anchor world's rl_strats. The paired worlds should share "
+                    "an identical unit superset; this unit's exploration state cannot "
+                    "be synced and the shared-buffer alignment may be compromised.",
+                    unit_id,
+                )
                 continue
             anchor_strat = self.anchor.learning_role.rl_strats[unit_id]
             if not hasattr(anchor_strat, "collect_initial_experience_mode"):

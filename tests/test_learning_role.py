@@ -607,3 +607,163 @@ async def test_atomic_swap_concurrent_writes(learning_role):
     assert th.equal(
         learning_role.all_obs[concurrent_data_ts]["unit_1"][0], concurrent_obs
     )
+
+
+@pytest.mark.require_learning
+async def test_shared_buffer_uses_anchor_unit_order_in_staggered():
+    """Regression: in staggered training two paired worlds share one replay
+    buffer and one centralized critic. The critic indexes agents by the anchor
+    role's ``rl_strats`` order, so *both* worlds must write their transitions
+    into the buffer using that same anchor order.
+
+    A secondary world whose ``rl_strats`` happen to be registered in a different
+    order (e.g. each scenario's superset appends its own foreign units last)
+    must not scramble the obs/actions/mask columns of the shared buffer. Before
+    the fix, the secondary world wrote columns in its own order, so the
+    centralized critic received another unit's observations/actions under a
+    given agent's column — feeding garbage into the critic and silently leaving
+    some agents permanently masked out (active_count == 0 every batch).
+    """
+    import numpy as np
+    import torch as th
+
+    from assume.reinforcement_learning.buffer import ReplayBuffer
+
+    config = LearningConfig(
+        train_freq="1h",
+        algorithm="matd3",
+        actor_architecture="mlp",
+        learning_mode=True,
+        evaluation_mode=False,
+        training_episodes=3,
+        episodes_collecting_initial_experience=1,
+        continue_learning=False,
+        trained_policies_save_path=None,
+    )
+
+    # Anchor role: canonical agent order A, B, C (what the critic indexes by).
+    anchor = Learning(config, start=start, end=end)
+    anchor.rl_strats = {"A": MagicMock(), "B": MagicMock(), "C": MagicMock()}
+
+    # Secondary role: SAME units, DIFFERENT registration order (A, C, B).
+    secondary = Learning(config, start=start, end=end)
+    secondary.rl_strats = {"A": MagicMock(), "C": MagicMock(), "B": MagicMock()}
+
+    # Mimic _share_learning_state: the shared algorithm's learning_role is the
+    # anchor, and the buffer is shared.
+    shared_buffer = ReplayBuffer(
+        buffer_size=10,
+        obs_dim=2,
+        act_dim=1,
+        n_rl_units=3,
+        device=th.device("cpu"),
+        float_type=th.float,
+    )
+    anchor.buffer = shared_buffer
+    secondary.buffer = shared_buffer
+    secondary.rl_algorithm = anchor.rl_algorithm
+
+    # Don't trigger a policy update (episode 0 = initial experience collection).
+    secondary.episodes_done = 0
+
+    ts = "2024-01-01 00:00:00"
+    # Per-unit distinguishable data so a column swap is detectable.
+    cache = {
+        "obs": {
+            ts: {
+                "A": [th.tensor([1.0, 1.0])],
+                "B": [th.tensor([2.0, 2.0])],
+                "C": [th.tensor([3.0, 3.0])],
+            }
+        },
+        "actions": {
+            ts: {
+                "A": [th.tensor([10.0])],
+                "B": [th.tensor([20.0])],
+                "C": [th.tensor([30.0])],
+            }
+        },
+        "rewards": {ts: {"A": [1.0], "B": [2.0], "C": [3.0]}},
+        # C is foreign here -> active 0; A and B native -> active 1.
+        "active": {ts: {"A": [1.0], "B": [1.0], "C": [0.0]}},
+    }
+
+    await secondary._store_to_buffer_and_update_sync(cache, th.device("cpu"))
+
+    # The buffer columns must follow the ANCHOR order (A, B, C), regardless of
+    # the secondary world's own (A, C, B) order.
+    np.testing.assert_allclose(
+        shared_buffer.observations[0],
+        np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]),
+    )
+    np.testing.assert_allclose(
+        shared_buffer.actions[0], np.array([[10.0], [20.0], [30.0]])
+    )
+    # Mask must stay attached to the right agent: C (anchor index 2) is foreign.
+    np.testing.assert_allclose(shared_buffer.masks[0], np.array([1.0, 1.0, 0.0]))
+
+
+@pytest.mark.require_learning
+async def test_store_to_buffer_rejects_unit_id_set_mismatch():
+    """Guard: if a world's cache reports a unit-id *set* that differs from the
+    shared learning role's ``rl_strats`` (not merely a different count), the
+    transition must be rejected instead of silently zero-filling the missing
+    anchor column and dropping the unexpected one. A silent set-mismatch would
+    scramble the centralized-critic columns exactly like the per-world ordering
+    bug, so it must be caught loudly and skip the buffer write.
+    """
+    import torch as th
+
+    from assume.reinforcement_learning.buffer import ReplayBuffer
+
+    config = LearningConfig(
+        train_freq="1h",
+        algorithm="matd3",
+        actor_architecture="mlp",
+        learning_mode=True,
+        evaluation_mode=False,
+        training_episodes=3,
+        episodes_collecting_initial_experience=1,
+        continue_learning=False,
+        trained_policies_save_path=None,
+    )
+
+    role = Learning(config, start=start, end=end)
+    role.rl_strats = {"A": MagicMock(), "B": MagicMock(), "C": MagicMock()}
+
+    buffer = ReplayBuffer(
+        buffer_size=10,
+        obs_dim=2,
+        act_dim=1,
+        n_rl_units=3,
+        device=th.device("cpu"),
+        float_type=th.float,
+    )
+    role.buffer = buffer
+
+    ts = "2024-01-01 00:00:00"
+    # Same COUNT (3) but a different SET: "X" replaces "C".
+    cache = {
+        "obs": {
+            ts: {
+                "A": [th.tensor([1.0, 1.0])],
+                "B": [th.tensor([2.0, 2.0])],
+                "X": [th.tensor([3.0, 3.0])],
+            }
+        },
+        "actions": {
+            ts: {
+                "A": [th.tensor([10.0])],
+                "B": [th.tensor([20.0])],
+                "X": [th.tensor([30.0])],
+            }
+        },
+        "rewards": {ts: {"A": [1.0], "B": [2.0], "X": [3.0]}},
+        "active": {ts: {"A": [1.0], "B": [1.0], "X": [1.0]}},
+    }
+
+    await role._store_to_buffer_and_update_sync(cache, th.device("cpu"))
+
+    # Nothing should have been written to the buffer.
+    assert buffer.pos == 0
+    assert buffer.full is False

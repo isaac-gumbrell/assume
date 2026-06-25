@@ -301,31 +301,54 @@ class Learning(Role):
         Further triggers the next policy update
 
         """
+        # Canonical column order for the SHARED replay buffer. The centralized
+        # critic indexes agents by ``rl_algorithm.learning_role.rl_strats`` (the
+        # anchor world's order in staggered training). Each world must therefore
+        # write its transitions into the buffer using that same anchor order —
+        # not its own ``self.rl_strats`` order. In staggered training the two
+        # worlds load the same superset but can register units in a different
+        # order (e.g. each scenario appends *its own* foreign units last), so
+        # using the per-world order would scramble the obs/actions/mask columns
+        # of the secondary world relative to the critic and feed garbage into
+        # the centralized critic. For single-world training the anchor is this
+        # role itself, so this is identical to the previous behaviour.
+        buffer_unit_order = list(self.rl_algorithm.learning_role.rl_strats.keys())
+        expected_unit_ids = set(buffer_unit_order)
+
         first_start = next(iter(cache["obs"]))
         for name, buffer in [
             ("observations", cache["obs"]),
             ("actions", cache["actions"]),
             ("rewards", cache["rewards"]),
         ]:
-            # check if all entries for the buffers have the same number of unit_ids as rl_strats
-            if len(buffer[first_start]) != len(self.rl_strats):
+            # The cache must report exactly the anchor's unit ids — not merely the
+            # same *count*. ``transform_buffer_data`` fills columns by looking up
+            # each anchor unit id with ``dict.get(unit_id, [])``, so a unit id in
+            # the cache that is missing from ``buffer_unit_order`` would be
+            # silently dropped while the absent anchor id is silently zero-filled.
+            # That mismatched-set case scrambles the centralized-critic columns
+            # exactly like the per-world ordering bug, so reject it loudly instead
+            # of corrupting the buffer.
+            actual_unit_ids = set(buffer[first_start].keys())
+            if actual_unit_ids != expected_unit_ids:
+                missing = expected_unit_ids - actual_unit_ids
+                unexpected = actual_unit_ids - expected_unit_ids
                 logger.error(
-                    f"Number of unit_ids with {name} in learning role ({len(buffer[first_start])}) does not match number of rl_strats ({len(self.rl_strats)}). "
-                    "It seems like some learning_instances are not reporting experience. Cannot store to buffer and update policy!"
+                    f"Unit ids reporting {name} ({len(actual_unit_ids)}) do not match the "
+                    f"shared learning role's rl_strats ({len(expected_unit_ids)}). "
+                    f"missing={sorted(missing)} unexpected={sorted(unexpected)}. "
+                    "This would scramble or zero-fill the centralized-critic columns. "
+                    "Cannot store to buffer and update policy!"
                 )
                 return
 
         # rewrite dict so that obs.shape == (n_rl_units, obs_dim) and sorted by keys and store in buffer
         self.buffer.add(
-            obs=transform_buffer_data(cache["obs"], device, self.rl_strats.keys()),
-            actions=transform_buffer_data(
-                cache["actions"], device, self.rl_strats.keys()
-            ),
-            reward=transform_buffer_data(
-                cache["rewards"], device, self.rl_strats.keys()
-            ),
+            obs=transform_buffer_data(cache["obs"], device, buffer_unit_order),
+            actions=transform_buffer_data(cache["actions"], device, buffer_unit_order),
+            reward=transform_buffer_data(cache["rewards"], device, buffer_unit_order),
             mask=np.squeeze(
-                transform_buffer_data(cache["active"], device, self.rl_strats.keys()),
+                transform_buffer_data(cache["active"], device, buffer_unit_order),
                 axis=-1,
             ),
         )
@@ -590,10 +613,12 @@ class Learning(Role):
         )
         elapsed_duration = current_timestamp - self.start
 
-        # Fraction of the current episode that has elapsed. Clamp defensively
-        # so any unexpected out-of-range clock can never push
-        # ``progress_remaining`` outside ``[0, 1]`` and blow up the
-        # learning-rate / noise schedules.
+        # Fraction of the current episode that has elapsed. The world clock must
+        # lie within ``[start, end]``; clamp defensively so a stale or unset
+        # clock (e.g. the shared learning role in staggered training, whose
+        # ``context`` belongs to the anchor world and can read 0 while the
+        # secondary world is stepping) can never push ``progress_remaining``
+        # outside ``[0, 1]`` and blow up the learning-rate / noise schedules.
         if total_duration > 0:
             within_episode_fraction = elapsed_duration / total_duration
         else:

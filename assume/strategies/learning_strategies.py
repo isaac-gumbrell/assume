@@ -279,8 +279,11 @@ class TorchLearningStrategy(LearningStrategy):
                 # =============================================================================
                 # 2.1 Get Actions and handle exploration
                 # =============================================================================
-                # only use noise as the action to enforce exploration
-                curr_action = noise
+                # only use noise as the action to enforce exploration. Clone so the
+                # action is a distinct tensor from the returned ``noise``: subclasses
+                # bias the action in place (e.g. ``curr_action += marginal_cost``),
+                # and aliasing would corrupt the recorded exploration-noise diagnostic.
+                curr_action = noise.clone()
 
             else:
                 # if we are not in the initial exploration phase we chose the action with the actor neural net

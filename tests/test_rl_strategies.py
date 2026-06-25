@@ -170,6 +170,48 @@ def test_learning_strategies_parametrized(
     assert costs[0] == 40000.0  # Assumes hot_start_cost = 20000 by default
 
 
+@pytest.mark.require_learning
+def test_initial_experience_noise_not_contaminated_by_marginal_cost():
+    """Regression: the exploration-noise diagnostic must stay pure.
+
+    During initial-experience collection ``EnergyLearningStrategy.get_actions``
+    biases the action towards the marginal cost (``curr_action += marginal_cost``).
+    The base class must return the action as a *distinct* tensor from ``noise`` so
+    this in-place bias does not leak into the recorded noise. Previously the two
+    aliased the same tensor, so the logged noise became ``noise + marginal_cost``
+    and looked inflated for scenarios with higher marginal costs (e.g. the
+    secondary world in staggered training).
+    """
+    import torch as th
+
+    config = {
+        "unit_id": "test_pp",
+        "learning_config": LearningConfig(
+            algorithm="matd3",
+            learning_mode=True,
+            training_episodes=3,
+        ),
+    }
+    learning_role = Learning(config["learning_config"], start, end)
+    strategy = EnergyLearningStrategy(learning_role=learning_role, **config)
+    strategy.collect_initial_experience_mode = True
+
+    marginal_cost = 0.3
+    observation = th.zeros(strategy.obs_dim, dtype=strategy.float_type)
+    observation[-1] = marginal_cost
+
+    action, noise = strategy.get_actions(observation)
+
+    # The action is the noise biased by the (scalar) marginal cost; the returned
+    # noise must remain the pure exploration component, i.e. they are not aliased.
+    assert action.data_ptr() != noise.data_ptr()
+    assert th.allclose(
+        action - noise,
+        th.full_like(noise, marginal_cost),
+        atol=1e-6,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Congestion strategy tests
 # ---------------------------------------------------------------------------
