@@ -153,3 +153,4 @@ examples/notebooks/outputs
 *.nbconvert.ipynb
 fameSetup.yaml
 .claude
+rl_debug
