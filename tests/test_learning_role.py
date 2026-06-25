@@ -265,6 +265,89 @@ def test_write_rl_grad_params_uses_global_update_counter():
     assert [row["step"] for row in rows] == [6, 7]
 
 
+def _progress_config():
+    return {
+        "foresight": 1,
+        "act_dim": 2,
+        "unique_obs_dim": 0,
+        "learning_config": LearningConfig(
+            train_freq="1h",
+            algorithm="matd3",
+            actor_architecture="mlp",
+            learning_mode=True,
+            evaluation_mode=False,
+            training_episodes=3,
+            episodes_collecting_initial_experience=1,
+            continue_learning=False,
+            trained_policies_save_path=None,
+            early_stopping_steps=10,
+            early_stopping_threshold=0.05,
+        ),
+    }
+
+
+@pytest.mark.require_learning
+def test_get_progress_remaining_uses_in_range_context_clock():
+    """Single-world training: the within-episode fraction follows the role's
+    own context clock, so progress decays smoothly inside an episode.
+    """
+    learn = Learning(_progress_config()["learning_config"], start=start, end=end)
+    learn._context = MagicMock()
+    # learning_episodes = training_episodes - collecting = 2; one learning
+    # episode completed, so the coarse term contributes 0 and the fraction term
+    # contributes (1 / 2) * within_episode_fraction.
+    learn.episodes_done = 1
+
+    # Half-way through the episode -> within_episode_fraction == 0.5.
+    learn._context.current_timestamp = learn.start + (learn.end - learn.start) / 2
+
+    assert learn.get_progress_remaining() == pytest.approx(0.75)
+
+
+@pytest.mark.require_learning
+def test_get_progress_remaining_clamps_out_of_range_clock():
+    """Regression guard: a stale/unset clock (e.g. the shared anchor role in
+    staggered training reading 0) must never push progress_remaining outside
+    ``[0, 1]`` and blow up the LR/noise schedules.
+    """
+    learn = Learning(_progress_config()["learning_config"], start=start, end=end)
+    learn._context = MagicMock()
+    learn.episodes_done = 1
+
+    # Stale anchor clock reads 0 -> strongly negative elapsed_duration. Before
+    # clamping this produced progress_remaining far above 1 (the original bug).
+    learn._context.current_timestamp = 0.0
+    progress_below = learn.get_progress_remaining()
+    assert 0.0 <= progress_below <= 1.0
+    # Clamped to within_episode_fraction == 0 -> only the coarse term remains.
+    assert progress_below == pytest.approx(1.0)
+
+    # A clock past the episode end clamps the other way (fraction == 1).
+    learn._context.current_timestamp = learn.end + 1e9
+    progress_above = learn.get_progress_remaining()
+    assert 0.0 <= progress_above <= 1.0
+    assert progress_above == pytest.approx(0.5)
+
+
+@pytest.mark.require_learning
+def test_get_progress_remaining_prefers_stepping_world_clock():
+    """The proper staggered fix: when ``_progress_timestamp`` is set to the
+    clock of the world currently stepping, the within-episode ramp follows it
+    even though this role's own context clock is stale (reads 0). This restores
+    smooth intra-episode decay that the bare clamp would otherwise freeze.
+    """
+    learn = Learning(_progress_config()["learning_config"], start=start, end=end)
+    learn._context = MagicMock()
+    learn.episodes_done = 1
+
+    # Anchor role's own clock is stale...
+    learn._context.current_timestamp = 0.0
+    # ...but the stepping world is half-way through the episode.
+    learn._progress_timestamp = learn.start + (learn.end - learn.start) / 2
+
+    assert learn.get_progress_remaining() == pytest.approx(0.75)
+
+
 @pytest.fixture
 async def learning_role():
     """Fixture that provides a learning role configuration for atomic swap tests."""
