@@ -493,6 +493,7 @@ class TD3(RLAlgorithm):
                     "actor_total_grad_norm": None,
                     "actor_max_grad_norm": None,
                     "critic_loss": None,
+                    "critic_value": None,
                     "critic_total_grad_norm": None,
                     "critic_max_grad_norm": None,
                 }
@@ -648,6 +649,14 @@ class TD3(RLAlgorithm):
                 # Store the critic loss for this unit ID
                 unit_params[step][strategy.unit_id]["critic_loss"] = critic_loss.item()
                 total_critic_loss += critic_loss
+
+                # Store the mean predicted Q-value (first critic head) over the
+                # active transitions. Tracking this across episodes is the
+                # standard overestimation test: if predicted value inflates while
+                # the realised reward scale stays flat, the critic is diverging.
+                with th.no_grad():
+                    mean_q = (mask_i * current_Q_values[0]).sum() / mask_norm
+                unit_params[step][strategy.unit_id]["critic_value"] = mean_q.item()
 
             # Single backward pass for all agents' critics
             total_critic_loss.backward()

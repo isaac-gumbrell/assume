@@ -927,6 +927,7 @@ class Learning(Role):
                 "actor_total_grad_norm": params["actor_total_grad_norm"],
                 "actor_max_grad_norm": params["actor_max_grad_norm"],
                 "critic_loss": params["critic_loss"],
+                "critic_value": params.get("critic_value"),
                 "critic_total_grad_norm": params["critic_total_grad_norm"],
                 "critic_max_grad_norm": params["critic_max_grad_norm"],
                 "learning_rate": learning_rate,

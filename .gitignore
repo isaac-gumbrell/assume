@@ -154,3 +154,5 @@ examples/notebooks/outputs
 fameSetup.yaml
 .claude
 rl_debug
+*issues/
+pathology_report.html
