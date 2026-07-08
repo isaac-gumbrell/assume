@@ -199,13 +199,17 @@ class TensorBoardLogger:
         #  Values per gradient step  #
         ##############################
 
-        # Define the SQL query dynamically
+        # Define the SQL query dynamically. critic_value (mean predicted Q) is
+        # emitted alongside critic_loss so value overestimation is visible in
+        # TensorBoard: predicted Q inflating faster than realised reward is the
+        # overestimation signature, whereas tracking reward is benign growth.
         rl_grad_columns = """
             AVG(step) AS step,
             AVG(actor_loss) AS actor_loss,
             AVG(actor_total_grad_norm) AS actor_total_grad_norm,
             MAX(actor_max_grad_norm) AS actor_max_grad_norm,
             AVG(critic_loss) AS critic_loss,
+            AVG(critic_value) AS critic_value,
             AVG(critic_total_grad_norm) AS critic_total_grad_norm,
             MAX(critic_max_grad_norm) AS critic_max_grad_norm,
             AVG(learning_rate) AS learning_rate
@@ -311,6 +315,7 @@ class TensorBoardLogger:
                     "10_critic_loss": "critic_loss",
                     "11_critic_total_grad_norm": "critic_total_grad_norm",
                     "12_critic_max_grad_norm": "critic_max_grad_norm",
+                    "13_critic_value": "critic_value",
                 }
 
                 # Group data upfront instead of filtering repeatedly

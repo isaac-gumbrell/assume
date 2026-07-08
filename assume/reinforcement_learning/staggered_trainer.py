@@ -528,9 +528,9 @@ class StaggeredTrainer:
                             conn.execute(
                                 text(
                                     f"DELETE FROM {tbl} WHERE simulation = :sid"
-                                    " AND evaluation_mode = 0"
+                                    " AND evaluation_mode = :eval_mode"
                                 ),
-                                {"sid": sim_id},
+                                {"sid": sim_id, "eval_mode": False},
                             )
                         except Exception:
                             pass  # table may not exist yet on a truly fresh DB
