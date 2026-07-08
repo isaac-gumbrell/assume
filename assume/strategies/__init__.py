@@ -100,8 +100,10 @@ try:
     from assume.strategies.learning_strategies import (
         EnergyLearningStrategy,
         EnergyLearningSingleBidStrategy,
+        SRMCEnergyLearningStrategy,
         EnergyLearningStrategyCongestion,
         EnergyLearningSingleBidStrategyCongestion,
+        SRMCEnergyLearningStrategyCongestion,
         StorageEnergyLearningStrategy,
         StorageEnergyLearningStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategy,
@@ -121,6 +123,7 @@ try:
     bidding_strategies["powerplant_energy_learning_single_bid"] = (
         EnergyLearningSingleBidStrategy
     )
+    bidding_strategies["powerplant_energy_learning_srmc"] = SRMCEnergyLearningStrategy
     bidding_strategies["storage_energy_learning"] = StorageEnergyLearningStrategy
     bidding_strategies["renewable_energy_learning_single_bid"] = (
         RenewableEnergyLearningSingleBidStrategy
@@ -133,6 +136,9 @@ try:
     )
     bidding_strategies["powerplant_energy_learning_single_bid_congestion"] = (
         EnergyLearningSingleBidStrategyCongestion
+    )
+    bidding_strategies["powerplant_energy_learning_single_bid_congestion_srmc"] = (
+        SRMCEnergyLearningStrategyCongestion
     )
     bidding_strategies["storage_energy_learning_congestion"] = (
         StorageEnergyLearningStrategyCongestion

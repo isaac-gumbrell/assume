@@ -20,6 +20,8 @@ try:
         EnergyLearningStrategyCongestion,
         RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
         StorageEnergyLearningStrategyCongestion,
     )
 
@@ -31,6 +33,8 @@ except ImportError:
     StorageEnergyLearningStrategyCongestion = None
     RenewableEnergyLearningCompatibleStrategy = None
     RenewableEnergyLearningSingleBidStrategyCongestion = None
+    SRMCEnergyLearningStrategy = None
+    SRMCEnergyLearningStrategyCongestion = None
 
 from assume.units import PowerPlant
 
@@ -213,6 +217,139 @@ def test_initial_experience_noise_not_contaminated_by_marginal_cost():
 
 
 # ---------------------------------------------------------------------------
+# SRMC strategy tests
+# ---------------------------------------------------------------------------
+
+
+def _make_srmc_learning_role():
+    config = {
+        "unit_id": "test_pp",
+        "learning_config": LearningConfig(
+            algorithm="matd3",
+            learning_mode=True,
+            training_episodes=3,
+        ),
+    }
+    return Learning(config["learning_config"], start, end), config
+
+
+def _build_srmc_strategy(strategy_class, learning_role, config):
+    """Instantiate an SRMC strategy, supplying congestion kwargs when required."""
+    if issubclass(strategy_class, SRMCEnergyLearningStrategyCongestion):
+        return strategy_class(
+            learning_role=learning_role,
+            n_lines=3,
+            congestion_foresight=1,
+            **config,
+        )
+    return strategy_class(learning_role=learning_role, **config)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "strategy_class",
+    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+)
+@pytest.mark.parametrize(
+    "action_value, expected_fraction",
+    [(-1.0, 0.0), (0.0, 0.5), (1.0, 1.0)],
+)
+def test_srmc_bid_price_remap(
+    mock_market_config,
+    power_plant,
+    strategy_class,
+    action_value,
+    expected_fraction,
+):
+    """The action must be remapped linearly onto ``[SRMC, max_bid_price]``.
+
+    ``action = -1`` bids exactly at SRMC, ``action = +1`` at the price cap and
+    ``action = 0`` at the midpoint. The full available capacity is offered as a
+    single bid.
+    """
+    import torch as th
+
+    product_index = pd.date_range("2023-07-01", periods=1, freq="h")
+    mc = mock_market_config
+    mc.product_type = "energy_eom"
+    product_tuples = [(s, s + pd.Timedelta(hours=1), None) for s in product_index]
+
+    learning_role, config = _make_srmc_learning_role()
+    strategy = _build_srmc_strategy(strategy_class, learning_role, config)
+
+    srmc = 25.0
+    expected_price = srmc + expected_fraction * (strategy.max_bid_price - srmc)
+
+    with (
+        patch.object(
+            strategy_class,
+            "get_actions",
+            return_value=(th.tensor([action_value]), th.tensor(0.0)),
+        ),
+        patch.object(PowerPlant, "calculate_marginal_cost", return_value=srmc),
+    ):
+        bids = strategy.calculate_bids(power_plant, mc, product_tuples=product_tuples)
+
+    # single bid covering the full available capacity
+    assert len(bids) == 1
+    assert bids[0]["volume"] == power_plant.max_power
+    assert bids[0]["price"] == pytest.approx(expected_price)
+
+
+@pytest.mark.require_learning
+def test_srmc_bid_never_below_marginal_cost(mock_market_config, power_plant):
+    """Even the lowest action (-1) must never bid below the unit's SRMC."""
+    import torch as th
+
+    product_index = pd.date_range("2023-07-01", periods=1, freq="h")
+    mc = mock_market_config
+    mc.product_type = "energy_eom"
+    product_tuples = [(s, s + pd.Timedelta(hours=1), None) for s in product_index]
+
+    learning_role, config = _make_srmc_learning_role()
+    strategy = SRMCEnergyLearningStrategy(learning_role=learning_role, **config)
+
+    srmc = 42.0
+    with (
+        patch.object(
+            SRMCEnergyLearningStrategy,
+            "get_actions",
+            return_value=(th.tensor([-1.0]), th.tensor(0.0)),
+        ),
+        patch.object(PowerPlant, "calculate_marginal_cost", return_value=srmc),
+    ):
+        bids = strategy.calculate_bids(power_plant, mc, product_tuples=product_tuples)
+
+    assert bids[0]["price"] == pytest.approx(srmc)
+
+
+@pytest.mark.require_learning
+def test_srmc_get_actions_has_no_marginal_cost_bias():
+    """SRMC exploration must not add the marginal-cost bias used by the parent.
+
+    ``EnergyLearningStrategy`` shifts the initial-experience action by the
+    marginal cost (``curr_action += marginal_cost``). Because the SRMC strategy
+    bakes SRMC into the ``[SRMC, max_bid_price]`` bid remap, that bias would be
+    double-counted, so ``SRMCEnergyLearningStrategy.get_actions`` must delegate
+    straight to :class:`TorchLearningStrategy` and leave the action unbiased.
+    """
+    import torch as th
+
+    learning_role, config = _make_srmc_learning_role()
+    strategy = SRMCEnergyLearningStrategy(learning_role=learning_role, **config)
+    strategy.collect_initial_experience_mode = True
+
+    marginal_cost = 0.3
+    observation = th.zeros(strategy.obs_dim, dtype=strategy.float_type)
+    observation[-1] = marginal_cost
+
+    action, noise = strategy.get_actions(observation)
+
+    # No marginal-cost bias: the action equals the pure exploration noise.
+    assert th.allclose(action, noise, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Congestion strategy tests
 # ---------------------------------------------------------------------------
 
@@ -248,6 +385,7 @@ def _make_congestion_strategy(
     [
         EnergyLearningStrategyCongestion,
         EnergyLearningSingleBidStrategyCongestion,
+        SRMCEnergyLearningStrategyCongestion,
         StorageEnergyLearningStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategyCongestion,
     ],
