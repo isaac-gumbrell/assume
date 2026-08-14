@@ -1,10 +1,10 @@
-mode: batch  # single | batch
+mode: single  # single | batch
 
 inputs_path: "inputs"
-db_uri: "postgresql://assume:assume@172.22.26.171:5432/assume?sslmode=disable&gssencmode=disable"
+db_uri: sqlite:///assume.db #"postgresql://assume:assume@172.22.26.171:5432/assume?sslmode=disable&gssencmode=disable"
 
 # ── mode: single ──────────────────────────────────────────────────────────
-scenario: "srmc_INVEST_FG_Optgen_AE_CF_r17b_tr01_2030" #"profit_invest_2045_test" #"lt4"
+scenario: "srmc_FG_Hrly2040_GGR_CF_r03a_tr01_2040" #"profit_invest_2045_test" #"lt4"
 study_case: "run"
 
 # ── mode: batch ───────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@ study_case: "run"
 # automatically detected per-case and dispatched to run_staggered_learning.
 # Mix regular and staggered scenarios freely in the same list.
 scenarios:
-  - yr_profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030
+  - srmc_FG_Hrly2040_GGR_CF_r03a_tr01_2040
   # - yr_profit_INVEST_FG_Optgen_AE_CF_r17b_tr01_2030
   # - yr_srmc_BAU_FG_Optgen_AE_CF_r17b_tr01_2030
   # - "profit_BAU_FG_Optgen_AE_CF_r17b_tr01_2030"

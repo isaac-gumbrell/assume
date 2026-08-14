@@ -813,30 +813,52 @@ class EnergyLearningSingleBidStrategy(EnergyLearningStrategy, MinMaxStrategy):
 class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     """
     Reinforcement Learning Strategy for dispatchable powerplant units that scales the
-    bid action between the unit's short-run marginal cost (SRMC) and the maximum bid price.
+    bid action between the unit's short-run marginal cost (SRMC) and a configurable
+    multiple of it.
 
     This strategy is a variant of ``EnergyLearningSingleBidStrategy`` that submits a single
     bid covering the unit's full available capacity. Instead of mapping the actor's action
     from ``[-1, 1]`` directly to ``[-max_bid_price, +max_bid_price]``, it remaps the action
-    to the economically meaningful range ``[SRMC, max_bid_price]``. The SRMC is the unit's
-    marginal cost at the current dispatch point, so the agent effectively learns a *markup*
-    on top of its production cost:
+    to the economically meaningful range ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]``.
+    The SRMC is the unit's marginal cost at the current dispatch point, so the agent
+    effectively learns a *markup* on top of its production cost:
 
     - ``action = -1`` bids exactly at SRMC (marginal-cost bidding, always cost-covering).
-    - ``action = +1`` bids at the maximum allowable price.
+    - ``action = +1`` bids at ``SRMC * srmc_multiplier``, capped at ``max_bid_price``.
 
     Bidding never falls below SRMC, which prevents the agent from submitting loss-making
-    bids and focuses the learning signal on choosing the profit-maximising markup. This
-    mirrors the bounded remapping used in ``RenewableEnergyLearningCompatibleStrategy``
-    (which remaps to ``[0, max_bid_price]`` for near-zero-cost renewables).
+    bids and focuses the learning signal on choosing the profit-maximising markup. Bounding
+    the upper end of the action range to a multiple of SRMC (rather than the global
+    ``max_bid_price``) shrinks the action space to the economically relevant region for
+    each unit. This mirrors the bounded remapping used in
+    ``RenewableEnergyLearningCompatibleStrategy`` (which remaps to ``[0, max_bid_price]``
+    for near-zero-cost renewables).
 
     The observation structure, actor network architecture, and reward formulation are
     inherited unchanged from ``EnergyLearningSingleBidStrategy``.
 
+    Args:
+        srmc_multiplier (float): Factor applied to the unit's SRMC to obtain the upper
+            bound of the bid range (before capping at ``max_bid_price``). Required, and
+            must be finite and >= 1 so the action range is never empty or inverted.
+            Typically supplied via the global ``bidding_strategy_params`` config, e.g.
+            ``srmc_multiplier: 1.4``.
+        **kwargs: Forwarded to :class:`EnergyLearningSingleBidStrategy`.
+
     Attributes
     ----------
-    Inherits all attributes from ``EnergyLearningSingleBidStrategy``.
+    Inherits all attributes from ``EnergyLearningSingleBidStrategy``, plus:
+    - srmc_multiplier : float
+        Factor applied to SRMC to obtain the (pre-cap) upper bound of the bid range.
     """
+
+    def __init__(self, *args, srmc_multiplier: float, **kwargs):
+        if not np.isfinite(srmc_multiplier) or srmc_multiplier < 1:
+            raise ValueError(
+                f"srmc_multiplier must be a finite number >= 1, got {srmc_multiplier}."
+            )
+        self.srmc_multiplier = srmc_multiplier
+        super().__init__(*args, **kwargs)
 
     def get_actions(self, next_observation):
         """
@@ -863,9 +885,10 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         Generate a single price bid for the full available capacity (max_power).
 
         Overrides the parent to remap the action space from ``[-1, 1]`` to
-        ``[SRMC, max_bid_price]`` instead of ``[-max_bid_price, +max_bid_price]``.
-        A linear remap (instead of clamping) preserves full gradient resolution across
-        the valid bid range and guarantees bids never drop below the unit's SRMC.
+        ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]`` instead of
+        ``[-max_bid_price, +max_bid_price]``. A linear remap (instead of clamping)
+        preserves full gradient resolution across the valid bid range and guarantees
+        bids never drop below the unit's SRMC.
 
         Returns
         -------
@@ -884,6 +907,9 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         srmc = unit.calculate_marginal_cost(start, max_power)
         # keep SRMC within the valid bid range to guarantee a well-defined remap.
         srmc = min(max(srmc, 0.0), self.max_bid_price)
+        # upper bound of the bid range: a configurable multiple of SRMC, capped at
+        # the global max_bid_price so the safety limit is always respected.
+        upper_bound = min(srmc * self.srmc_multiplier, self.max_bid_price)
 
         # =============================================================================
         # 1. Get the Observations, which are the basis of the action decision
@@ -903,9 +929,9 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         # =============================================================================
         # 3. Transform Actions into bids
         # =============================================================================
-        # Remap from [-1, 1] to [SRMC, max_bid_price]. The agent thus learns a markup
-        # above marginal cost rather than an absolute price.
-        bid_price = srmc + ((actions[0] + 1) / 2) * (self.max_bid_price - srmc)
+        # Remap from [-1, 1] to [SRMC, min(SRMC * srmc_multiplier, max_bid_price)]. The
+        # agent thus learns a markup above marginal cost rather than an absolute price.
+        bid_price = srmc + ((actions[0] + 1) / 2) * (upper_bound - srmc)
 
         # actually formulate bids in orderbook format
         bids = [
@@ -1872,8 +1898,8 @@ class SRMCEnergyLearningStrategyCongestion(
 ):
     """SRMCEnergyLearningStrategy extended with per-line congestion observation channels.
 
-    Combines the ``[SRMC, max_bid_price]`` action remapping of
-    :class:`SRMCEnergyLearningStrategy` with the per-line congestion observation
+    Combines the ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]`` action remapping
+    of :class:`SRMCEnergyLearningStrategy` with the per-line congestion observation
     channels injected by :class:`_CongestionObsMixin`. The mixin only augments the
     observation vector; the SRMC bid transformation in ``calculate_bids`` and the
     ``get_actions`` override are inherited unchanged.
@@ -1881,6 +1907,8 @@ class SRMCEnergyLearningStrategyCongestion(
     Args:
         n_lines (int): Number of transmission lines (required).
         congestion_foresight (int): Window length for congestion channels. Default 1.
+        srmc_multiplier (float): Factor applied to SRMC to obtain the upper bound of
+            the bid range (required, see :class:`SRMCEnergyLearningStrategy`).
         **kwargs: Forwarded to :class:`SRMCEnergyLearningStrategy`.
     """
 
