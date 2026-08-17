@@ -813,18 +813,19 @@ class EnergyLearningSingleBidStrategy(EnergyLearningStrategy, MinMaxStrategy):
 class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     """
     Reinforcement Learning Strategy for dispatchable powerplant units that scales the
-    bid action between the unit's short-run marginal cost (SRMC) and a configurable
-    multiple of it.
+        bid action between the unit's short-run marginal cost (SRMC) and a bounded markup.
 
     This strategy is a variant of ``EnergyLearningSingleBidStrategy`` that submits a single
     bid covering the unit's full available capacity. Instead of mapping the actor's action
     from ``[-1, 1]`` directly to ``[-max_bid_price, +max_bid_price]``, it remaps the action
-    to the economically meaningful range ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]``.
+        to the economically meaningful range
+        ``[SRMC, min(max(SRMC * srmc_multiplier, srmc_upper_bound_floor), max_bid_price)]``.
     The SRMC is the unit's marginal cost at the current dispatch point, so the agent
     effectively learns a *markup* on top of its production cost:
 
     - ``action = -1`` bids exactly at SRMC (marginal-cost bidding, always cost-covering).
-    - ``action = +1`` bids at ``SRMC * srmc_multiplier``, capped at ``max_bid_price``.
+        - ``action = +1`` bids at the greater of ``SRMC * srmc_multiplier`` and
+            ``srmc_upper_bound_floor``, capped at ``max_bid_price``.
 
     Bidding never falls below SRMC, which prevents the agent from submitting loss-making
     bids and focuses the learning signal on choosing the profit-maximising markup. Bounding
@@ -843,6 +844,9 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
             must be finite and >= 1 so the action range is never empty or inverted.
             Typically supplied via the global ``bidding_strategy_params`` config, e.g.
             ``srmc_multiplier: 1.4``.
+        srmc_upper_bound_floor (float): Minimum value of the upper bid bound before
+            capping at ``max_bid_price``. Required, finite, and non-negative. This keeps
+            an effective action range for zero- and low-SRMC units, e.g. ``200``.
         **kwargs: Forwarded to :class:`EnergyLearningSingleBidStrategy`.
 
     Attributes
@@ -850,14 +854,28 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     Inherits all attributes from ``EnergyLearningSingleBidStrategy``, plus:
     - srmc_multiplier : float
         Factor applied to SRMC to obtain the (pre-cap) upper bound of the bid range.
+    - srmc_upper_bound_floor : float
+        Absolute floor applied to the upper bound before the global price cap.
     """
 
-    def __init__(self, *args, srmc_multiplier: float, **kwargs):
+    def __init__(
+        self,
+        *args,
+        srmc_multiplier: float,
+        srmc_upper_bound_floor: float,
+        **kwargs,
+    ):
         if not np.isfinite(srmc_multiplier) or srmc_multiplier < 1:
             raise ValueError(
                 f"srmc_multiplier must be a finite number >= 1, got {srmc_multiplier}."
             )
+        if not np.isfinite(srmc_upper_bound_floor) or srmc_upper_bound_floor < 0:
+            raise ValueError(
+                "srmc_upper_bound_floor must be a finite non-negative number, got "
+                f"{srmc_upper_bound_floor}."
+            )
         self.srmc_multiplier = srmc_multiplier
+        self.srmc_upper_bound_floor = srmc_upper_bound_floor
         super().__init__(*args, **kwargs)
 
     def get_actions(self, next_observation):
@@ -867,8 +885,8 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         Overrides ``EnergyLearningStrategy.get_actions`` to remove the marginal-cost
         exploration bias. That bias is only appropriate when the action maps linearly
         to an absolute price via ``action * max_bid_price``. Here the action is remapped
-        to ``[SRMC, max_bid_price]`` in :meth:`calculate_bids`, so SRMC is already baked
-        into the bid transformation and adding it again would double-count it. Initial
+        to an SRMC-bounded range in :meth:`calculate_bids`, so SRMC is already baked into
+        the bid transformation and adding it again would double-count it. Initial
         experience is therefore collected with pure noise-driven exploration.
         """
         curr_action, noise = TorchLearningStrategy.get_actions(self, next_observation)
@@ -885,10 +903,10 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         Generate a single price bid for the full available capacity (max_power).
 
         Overrides the parent to remap the action space from ``[-1, 1]`` to
-        ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]`` instead of
-        ``[-max_bid_price, +max_bid_price]``. A linear remap (instead of clamping)
-        preserves full gradient resolution across the valid bid range and guarantees
-        bids never drop below the unit's SRMC.
+        ``[SRMC, min(max(SRMC * srmc_multiplier, srmc_upper_bound_floor), max_bid_price)]``
+        instead of ``[-max_bid_price, +max_bid_price]``. A linear remap (instead of
+        clamping) preserves full gradient resolution across the valid bid range and
+        guarantees bids never drop below the unit's SRMC.
 
         Returns
         -------
@@ -907,9 +925,12 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         srmc = unit.calculate_marginal_cost(start, max_power)
         # keep SRMC within the valid bid range to guarantee a well-defined remap.
         srmc = min(max(srmc, 0.0), self.max_bid_price)
-        # upper bound of the bid range: a configurable multiple of SRMC, capped at
-        # the global max_bid_price so the safety limit is always respected.
-        upper_bound = min(srmc * self.srmc_multiplier, self.max_bid_price)
+        # The absolute floor preserves price-setting capability for zero- and low-SRMC
+        # units. The global max_bid_price remains the final safety cap.
+        upper_bound = min(
+            max(srmc * self.srmc_multiplier, self.srmc_upper_bound_floor),
+            self.max_bid_price,
+        )
 
         # =============================================================================
         # 1. Get the Observations, which are the basis of the action decision
@@ -929,8 +950,8 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         # =============================================================================
         # 3. Transform Actions into bids
         # =============================================================================
-        # Remap from [-1, 1] to [SRMC, min(SRMC * srmc_multiplier, max_bid_price)]. The
-        # agent thus learns a markup above marginal cost rather than an absolute price.
+        # Remap from [-1, 1] to the SRMC-bounded interval. The agent thus learns a
+        # markup above marginal cost rather than an absolute price.
         bid_price = srmc + ((actions[0] + 1) / 2) * (upper_bound - srmc)
 
         # actually formulate bids in orderbook format
@@ -975,6 +996,12 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         - If `action < 0`: The agent submits a **buy bid**.
         - If `action >= 0`: The agent submits a **sell bid**.
 
+    The signed action is scaled by ``storage_bid_price_limit`` rather than the global
+    ``max_bid_price``. This allows the global value to remain a common market,
+    observation, and reward scale while storage bids use a narrower symmetric action
+    range. The submitted order price is the absolute value of that signed price signal;
+    buy/sell direction is represented by the sign of the action and order volume.
+
     Rewards are based on the profit generated by the agent's market bids, with sell bids contributing
     positive profit and buy bids contributing negative profit. Additional components in the reward
     calculation include:
@@ -988,7 +1015,10 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
     foresight : int
         Number of time steps for forecasting market conditions. Defaults to 24.
     max_bid_price : float
-        Maximum allowable bid price. Defaults to 100.
+        Global market-price scale inherited from the learning configuration.
+    storage_bid_price_limit : float
+        Maximum absolute storage bid-price signal. Defaults to ``max_bid_price`` for
+        backward compatibility.
     device : str
         Device used for computation ("cpu" or "cuda"). Defaults to "cpu".
     float_type : str
@@ -1009,10 +1039,14 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
     Args
     ----
     *args : Variable length argument list.
+    storage_bid_price_limit : float, optional
+        Symmetric storage action-price limit. For example, ``2000`` maps normalized
+        actions from ``[-1, 1]`` to signed price signals from ``[-2000, 2000]``.
+        If omitted, the global ``max_bid_price`` is used.
     **kwargs : Arbitrary keyword arguments.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, storage_bid_price_limit: float | None = None, **kwargs):
         # 'foresight' represents the number of time steps into the future that we will consider
         # when constructing the observations.
         foresight = kwargs.pop("foresight", 24)
@@ -1025,6 +1059,19 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
             *args,
             **kwargs,
         )
+        if storage_bid_price_limit is None:
+            storage_bid_price_limit = self.max_bid_price
+        if not np.isfinite(storage_bid_price_limit) or storage_bid_price_limit <= 0:
+            raise ValueError(
+                "storage_bid_price_limit must be a finite positive number, got "
+                f"{storage_bid_price_limit}."
+            )
+        if storage_bid_price_limit > self.max_bid_price:
+            raise ValueError(
+                "storage_bid_price_limit must not exceed max_bid_price, got "
+                f"{storage_bid_price_limit} > {self.max_bid_price}."
+            )
+        self.storage_bid_price_limit = storage_bid_price_limit
 
     def get_individual_observations(
         self, unit: SupportsMinMaxCharge, start: datetime, end: datetime
@@ -1108,8 +1155,10 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         # =============================================================================
         # 3. Transform Actions into bids
         # =============================================================================
-        # the absolute value of the action determines the bid price
-        bid_price = abs(actions[0]) * self.max_bid_price
+        # The signed action represents a storage-specific price signal in
+        # [-storage_bid_price_limit, storage_bid_price_limit]. Order prices remain
+        # positive; the action sign selects buy (negative) or sell (positive).
+        bid_price = abs(actions[0]) * self.storage_bid_price_limit
         # the sign of the action determines the bid direction
         if actions[0] < 0:
             bid_direction = "buy"
@@ -1898,17 +1947,19 @@ class SRMCEnergyLearningStrategyCongestion(
 ):
     """SRMCEnergyLearningStrategy extended with per-line congestion observation channels.
 
-    Combines the ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]`` action remapping
-    of :class:`SRMCEnergyLearningStrategy` with the per-line congestion observation
-    channels injected by :class:`_CongestionObsMixin`. The mixin only augments the
-    observation vector; the SRMC bid transformation in ``calculate_bids`` and the
-    ``get_actions`` override are inherited unchanged.
+    Combines the SRMC-bounded action remapping of :class:`SRMCEnergyLearningStrategy`
+    with the per-line congestion observation channels injected by
+    :class:`_CongestionObsMixin`. The mixin only augments the observation vector; the
+    SRMC bid transformation in ``calculate_bids`` and the ``get_actions`` override are
+    inherited unchanged.
 
     Args:
         n_lines (int): Number of transmission lines (required).
         congestion_foresight (int): Window length for congestion channels. Default 1.
         srmc_multiplier (float): Factor applied to SRMC to obtain the upper bound of
             the bid range (required, see :class:`SRMCEnergyLearningStrategy`).
+        srmc_upper_bound_floor (float): Absolute floor for the upper bid bound
+            (required, see :class:`SRMCEnergyLearningStrategy`).
         **kwargs: Forwarded to :class:`SRMCEnergyLearningStrategy`.
     """
 

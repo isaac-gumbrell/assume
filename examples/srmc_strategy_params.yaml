@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: ASSUME Developers
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Add this section to a scenario study case that uses
+# powerplant_energy_learning_srmc or
+# powerplant_energy_learning_single_bid_congestion_srmc.
+# Ensure learning_config.max_bid_price is at least srmc_upper_bound_floor.
+bidding_strategy_params:
+  # Relative markup limit for units whose SRMC is high enough that this dominates.
+  srmc_multiplier: 1.4
+  # Absolute floor for the upper action bound, preserving bid flexibility for
+  # zero- and low-SRMC units. The global max_bid_price remains the final cap.
+  srmc_upper_bound_floor: 200.0

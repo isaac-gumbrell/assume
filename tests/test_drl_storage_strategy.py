@@ -37,8 +37,10 @@ def storage_unit() -> Storage:
             algorithm="matd3",
             learning_mode=True,
             training_episodes=3,
-            max_bid_price=100,
+            min_bid_price=-20_000,
+            max_bid_price=20_000,
         ),
+        "storage_bid_price_limit": 2_000,
     }
 
     index = pd.date_range("2023-06-30 22:00:00", periods=48, freq="h")
@@ -79,6 +81,35 @@ def mock_market_config():
 
 
 @pytest.mark.require_learning
+@pytest.mark.parametrize("action", [-1.0, 1.0])
+def test_storage_bid_limit_is_decoupled_from_global_price_scale(
+    mock_market_config,
+    storage_unit,
+    action,
+):
+    """Storage bid prices use their own limit in both action directions."""
+    product_start = pd.Timestamp("2023-07-01")
+    product_tuples = [(product_start, product_start + pd.Timedelta(hours=1), None)]
+    strategy = storage_unit.bidding_strategies["test_market"]
+
+    assert strategy.max_bid_price == 20_000
+    assert strategy.storage_bid_price_limit == 2_000
+
+    with patch.object(
+        StorageEnergyLearningStrategy,
+        "get_actions",
+        return_value=(th.tensor([action]), th.tensor(0.0)),
+    ):
+        bids = strategy.calculate_bids(
+            storage_unit,
+            mock_market_config,
+            product_tuples=product_tuples,
+        )
+
+    assert bids[0]["price"] == pytest.approx(2_000)
+
+
+@pytest.mark.require_learning
 def test_storage_rl_strategy_sell_bid(mock_market_config, storage_unit):
     """
     Test the StorageEnergyLearningStrategy for a 'sell' bid action.
@@ -94,7 +125,7 @@ def test_storage_rl_strategy_sell_bid(mock_market_config, storage_unit):
     # get the strategy
     strategy = storage_unit.bidding_strategies["test_market"]
 
-    # Define the 'sell' action: [0.2, 0.5] -> price=20, direction='sell'
+    # Define the 'sell' action: [0.2, 0.5] -> price=400, direction='sell'
     sell_action = [0.2, 0.5]
 
     # Mock the get_actions method to return the sell action
@@ -117,7 +148,9 @@ def test_storage_rl_strategy_sell_bid(mock_market_config, storage_unit):
             bid = bids[0]
 
             # Assert the bid price is correctly scaled
-            expected_bid_price = sell_action[0] * strategy.max_bid_price  # 20.0
+            expected_bid_price = (
+                sell_action[0] * strategy.storage_bid_price_limit
+            )  # 400.0
             assert bid["price"] == expected_bid_price, (
                 f"Expected bid price {expected_bid_price}, got {bid['price']}"
             )
@@ -131,7 +164,7 @@ def test_storage_rl_strategy_sell_bid(mock_market_config, storage_unit):
             )
 
             # Simulate bid acceptance by setting accepted_price and accepted_volume
-            bid["accepted_price"] = expected_bid_price  # 20.0
+            bid["accepted_price"] = expected_bid_price  # 400.0
             bid["accepted_volume"] = expected_volume  # 500
 
             # Calculate rewards based on the accepted bids
@@ -158,13 +191,13 @@ def test_storage_rl_strategy_sell_bid(mock_market_config, storage_unit):
             duration_hours = 1  # Since the product tuple is 1 hour
             expected_profit = (
                 expected_bid_price * bid["volume"] * duration_hours
-            )  # 20 * 500 * 1 = 10000
+            )  # 400 * 500 * 1 = 200000
             expected_costs = (
                 10.0 * bid["volume"] * duration_hours
             )  # 10 * 500 * 1 = 5000
             scaling_factor = 1 / (
                 storage_unit.max_power_discharge * strategy.max_bid_price
-            )  # 1 / (500*100) = 0.00002
+            )  # Reward remains scaled by the global max_bid_price.
             expected_reward = (
                 expected_profit - expected_costs
             ) * scaling_factor  # (10000 - 5000) * 0.0002 = 1.0
@@ -200,7 +233,7 @@ def test_storage_rl_strategy_buy_bid(mock_market_config, storage_unit):
     # Instantiate the StorageEnergyLearningStrategy
     strategy = storage_unit.bidding_strategies["test_market"]
 
-    # Define the 'buy' action: [-0.3] -> price=30, direction='buy'
+    # Define the 'buy' action: [-0.3] -> price=600, direction='buy'
     buy_action = [-0.3]
 
     # Mock the get_actions method to return the buy action
@@ -223,7 +256,9 @@ def test_storage_rl_strategy_buy_bid(mock_market_config, storage_unit):
             bid = bids[0]
 
             # Assert the bid price is correctly scaled
-            expected_bid_price = abs(buy_action[0]) * strategy.max_bid_price  # 30.0
+            expected_bid_price = (
+                abs(buy_action[0]) * strategy.storage_bid_price_limit
+            )  # 600.0
             assert math.isclose(bid["price"], expected_bid_price, abs_tol=1e3), (
                 f"Expected bid price {expected_bid_price}, got {bid['price']}"
             )
@@ -235,7 +270,7 @@ def test_storage_rl_strategy_buy_bid(mock_market_config, storage_unit):
             )
 
             # Simulate bid acceptance by setting accepted_price and accepted_volume
-            bid["accepted_price"] = expected_bid_price  # 30.0
+            bid["accepted_price"] = expected_bid_price  # 600.0
             bid["accepted_volume"] = expected_volume  # 500
 
             # Calculate rewards based on the accepted bids
@@ -262,13 +297,13 @@ def test_storage_rl_strategy_buy_bid(mock_market_config, storage_unit):
             duration_hours = 1  # Since the product tuple is 1 hour
             expected_profit = (
                 expected_bid_price * bid["volume"] * duration_hours
-            )  # 30 * 500 * 1 = 15000
+            )  # 600 * -500 * 1 = -300000
             expected_costs = (
                 15.0 * abs(bid["volume"]) * duration_hours
             )  # 15 * 500 * 1 = 7500
             scaling_factor = 1 / (
                 storage_unit.max_power_discharge * strategy.max_bid_price
-            )  # 1 / (500*100) = 0.00002
+            )  # Reward remains scaled by the global max_bid_price.
             expected_reward = (
                 expected_profit - expected_costs
             ) * scaling_factor  # (15000 - 7500) * 0.0002 = 1.5
@@ -309,9 +344,9 @@ def test_storage_rl_strategy_soc_and_cost_stored_energy(
     # Define sequence of actions over 3 hours: [charge, sell, sell]
     # Format: [normalized_price (-1, 1), direction indicated by sign (negative: buy bid, positive: sell bid)]
     actions = [
-        [-0.3],  # Charge at price 30
-        [0.6],  # Sell at price 60
-        [0.8],  # Sell at price 80
+        [-0.3],  # Charge at price 600
+        [0.6],  # Sell at price 1200
+        [0.8],  # Sell at price 1600
     ]
 
     # Patch get_actions to return one action at a time
@@ -360,16 +395,18 @@ def test_storage_rl_strategy_soc_and_cost_stored_energy(
             f"Expected SoC at t=0 to be {expected_soc_t0}, got {soc[0]}"
         )
         # Initial state: 500 MWh at default energy costs of 0 €/MWh
-        # 1. Charge 500 MWh at 30 €/MWh: cost_stored_energy_t1 = (0 €/MWh * 500 MWh - ((30 €/MWh + 5 €/MWh) * - 500 MW * 1h)) / 950 MWh = 18.41 €/MWh
+        # 1. Charge 500 MWh at 600 €/MWh: cost_stored_energy_t1 =
+        # (0 €/MWh * 500 MWh - ((600 €/MWh + 5 €/MWh) * -500 MW * 1h))
+        # / 950 MWh = 318.42 €/MWh
         expected_soc_t1 = 0.5 + (500 * 0.9 / 1000)  # 0.95
         assert math.isclose(soc[1], expected_soc_t1, rel_tol=1e-3), (
             f"Expected SoC at t=1 to be {expected_soc_t1}, got {soc[1]}"
         )
-        expected_cost_t1 = (500 * 35) / 950
+        expected_cost_t1 = (500 * 605) / 950
         assert math.isclose(cost_stored_energy[1], expected_cost_t1, rel_tol=1e-3), (
             f"Expected energy cost at t=1 to be {expected_cost_t1}, got {cost_stored_energy[1]}"
         )
-        # 2. Discharge 500 MWh at 60 €/MWh: cost_stored_energy_t2 = 18.41 €/MWh unchanged
+        # 2. Discharge 500 MWh at 1200 €/MWh: stored energy cost is unchanged.
         expected_soc_t2 = 0.95 - (500 / 0.9 / 1000)  # 0.3944
         assert math.isclose(soc[2], expected_soc_t2, rel_tol=1e-3), (
             f"Expected SoC at t=2 to be {expected_soc_t2}, got {soc[2]}"
@@ -378,7 +415,8 @@ def test_storage_rl_strategy_soc_and_cost_stored_energy(
         assert math.isclose(cost_stored_energy[2], expected_cost_t2, rel_tol=1e-3), (
             f"Expected energy cost at t=2 to be {expected_cost_t2}, got {cost_stored_energy[2]}"
         )
-        # 3. Discharge remaining 355 MWh at 80 €/Mwh: SoC < 1 --> cost_stored_energy_t3 = 0 €/MWh
+        # 3. Discharge remaining 355 MWh at 1600 €/MWh: SoC < 1 MWh, so
+        # cost_stored_energy_t3 = 0 €/MWh.
         expected_soc_t3 = 0.3944 - (355 / 0.9 / 1000)  # 0
         # use abs_tol here as values are close to zero
         assert math.isclose(soc[3], expected_soc_t3, abs_tol=0.1), (

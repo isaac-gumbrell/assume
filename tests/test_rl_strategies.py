@@ -221,15 +221,20 @@ def test_initial_experience_noise_not_contaminated_by_marginal_cost():
 # ---------------------------------------------------------------------------
 
 
-def _make_srmc_learning_role(srmc_multiplier=1.4):
+def _make_srmc_learning_role(
+    srmc_multiplier=1.4,
+    srmc_upper_bound_floor=200.0,
+):
     config = {
         "unit_id": "test_pp",
         "learning_config": LearningConfig(
             algorithm="matd3",
             learning_mode=True,
             training_episodes=3,
+            max_bid_price=700.0,
         ),
         "srmc_multiplier": srmc_multiplier,
+        "srmc_upper_bound_floor": srmc_upper_bound_floor,
     }
     return Learning(config["learning_config"], start, end), config
 
@@ -255,7 +260,7 @@ def _build_srmc_strategy(strategy_class, learning_role, config):
     "action_value, expected_fraction",
     [(-1.0, 0.0), (0.0, 0.5), (1.0, 1.0)],
 )
-@pytest.mark.parametrize("srmc_multiplier", [1.4, 5.0])
+@pytest.mark.parametrize("srmc_multiplier", [1.4, 40.0])
 def test_srmc_bid_price_remap(
     mock_market_config,
     power_plant,
@@ -265,13 +270,12 @@ def test_srmc_bid_price_remap(
     srmc_multiplier,
 ):
     """The action must be remapped linearly onto
-    ``[SRMC, min(SRMC * srmc_multiplier, max_bid_price)]``.
+    ``[SRMC, min(max(SRMC * multiplier, upper floor), max_bid_price)]``.
 
     ``action = -1`` bids exactly at SRMC, ``action = +1`` at the (capped) upper
     bound and ``action = 0`` at the midpoint. The full available capacity is
-    offered as a single bid. With ``srmc_multiplier=5.0`` and ``srmc=25.0`` the
-    uncapped upper bound (125.0) exceeds the default ``max_bid_price`` (100.0),
-    exercising the cap.
+    offered as a single bid. The 1.4 multiplier exercises the 200 upper-bound
+    floor, while the 40.0 multiplier exercises the 700 global price cap.
     """
     import torch as th
 
@@ -284,7 +288,10 @@ def test_srmc_bid_price_remap(
     strategy = _build_srmc_strategy(strategy_class, learning_role, config)
 
     srmc = 25.0
-    upper_bound = min(srmc * srmc_multiplier, strategy.max_bid_price)
+    upper_bound = min(
+        max(srmc * srmc_multiplier, strategy.srmc_upper_bound_floor),
+        strategy.max_bid_price,
+    )
     expected_price = srmc + expected_fraction * (upper_bound - srmc)
 
     with (
@@ -301,6 +308,40 @@ def test_srmc_bid_price_remap(
     assert len(bids) == 1
     assert bids[0]["volume"] == power_plant.max_power
     assert bids[0]["price"] == pytest.approx(expected_price)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "strategy_class",
+    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+)
+def test_srmc_upper_bound_floor_allows_zero_cost_markup(
+    mock_market_config,
+    power_plant,
+    strategy_class,
+):
+    """A zero-SRMC unit must retain the configured bid-price action range."""
+    import torch as th
+
+    product_index = pd.date_range("2023-07-01", periods=1, freq="h")
+    mc = mock_market_config
+    mc.product_type = "energy_eom"
+    product_tuples = [(s, s + pd.Timedelta(hours=1), None) for s in product_index]
+
+    learning_role, config = _make_srmc_learning_role()
+    strategy = _build_srmc_strategy(strategy_class, learning_role, config)
+
+    with (
+        patch.object(
+            strategy_class,
+            "get_actions",
+            return_value=(th.tensor([1.0]), th.tensor(0.0)),
+        ),
+        patch.object(PowerPlant, "calculate_marginal_cost", return_value=0.0),
+    ):
+        bids = strategy.calculate_bids(power_plant, mc, product_tuples=product_tuples)
+
+    assert bids[0]["price"] == pytest.approx(200.0)
 
 
 @pytest.mark.require_learning
@@ -361,10 +402,14 @@ def test_srmc_get_actions_has_no_marginal_cost_bias():
     "strategy_class",
     [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
 )
-def test_srmc_multiplier_required(strategy_class):
-    """Instantiation must fail if ``srmc_multiplier`` is not supplied."""
+@pytest.mark.parametrize(
+    "missing_parameter",
+    ["srmc_multiplier", "srmc_upper_bound_floor"],
+)
+def test_srmc_bound_parameters_required(strategy_class, missing_parameter):
+    """Instantiation must fail if either SRMC bound parameter is not supplied."""
     learning_role, config = _make_srmc_learning_role()
-    del config["srmc_multiplier"]
+    del config[missing_parameter]
 
     with pytest.raises(TypeError):
         _build_srmc_strategy(strategy_class, learning_role, config)
@@ -381,6 +426,22 @@ def test_srmc_multiplier_required(strategy_class):
 def test_srmc_multiplier_validation(strategy_class, invalid_multiplier):
     """Instantiation must reject multipliers below 1 or non-finite values."""
     learning_role, config = _make_srmc_learning_role(invalid_multiplier)
+
+    with pytest.raises(ValueError):
+        _build_srmc_strategy(strategy_class, learning_role, config)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "strategy_class",
+    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+)
+@pytest.mark.parametrize("invalid_floor", [-1.0, float("nan"), float("inf")])
+def test_srmc_upper_bound_floor_validation(strategy_class, invalid_floor):
+    """Instantiation must reject negative or non-finite upper-bound floors."""
+    learning_role, config = _make_srmc_learning_role(
+        srmc_upper_bound_floor=invalid_floor
+    )
 
     with pytest.raises(ValueError):
         _build_srmc_strategy(strategy_class, learning_role, config)
@@ -406,6 +467,7 @@ def _make_congestion_strategy(
     extra_kwargs = {}
     if issubclass(strategy_class, SRMCEnergyLearningStrategy):
         extra_kwargs["srmc_multiplier"] = 1.4
+        extra_kwargs["srmc_upper_bound_floor"] = 200.0
     return strategy_class(
         unit_id="test_pp",
         learning_config=LearningConfig(

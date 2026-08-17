@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: ASSUME Developers
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Add these sections to a scenario study case that uses
+# storage_energy_learning or storage_energy_learning_congestion.
+learning_config:
+  # Global market-price, observation, and reward scale shared by learning agents.
+  min_bid_price: -20000.0
+  max_bid_price: 20000.0
+
+bidding_strategy_params:
+  # Symmetric signed action-price limit for storage only. Normalized storage
+  # actions map from [-1, 1] to [-2000, 2000]; the submitted order price is the
+  # absolute value, while the sign selects charging or discharging.
+  storage_bid_price_limit: 2000.0
