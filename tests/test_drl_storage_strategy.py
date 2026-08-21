@@ -304,12 +304,16 @@ def test_storage_rl_strategy_buy_bid(mock_market_config, storage_unit):
             scaling_factor = 1 / (
                 storage_unit.max_power_discharge * strategy.max_bid_price
             )  # Reward remains scaled by the global max_bid_price.
+            # The cash loss from charging is exactly offset by the value of the energy
+            # added to storage, so charging is reward-neutral rather than always worse
+            # than idling.
+            inventory_value_change = -(expected_profit - expected_costs)
             expected_reward = (
-                expected_profit - expected_costs
-            ) * scaling_factor  # (15000 - 7500) * 0.0002 = 1.5
+                expected_profit - expected_costs + inventory_value_change
+            ) * scaling_factor
 
             # Assert the calculated reward
-            assert reward == expected_reward, (
+            assert math.isclose(reward, expected_reward, abs_tol=1e-9), (
                 f"Expected reward {expected_reward}, got {reward}"
             )
 

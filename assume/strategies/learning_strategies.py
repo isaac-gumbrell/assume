@@ -26,6 +26,30 @@ from assume.reinforcement_learning.learning_utils import NormalActionNoise
 logger = logging.getLogger(__name__)
 
 
+def resolve_clearing_price(
+    unit: BaseUnit, market_id: str, orderbook: Orderbook, start: datetime
+) -> float:
+    """Return the market clearing price for ``start``.
+
+    The clearing algorithms write ``accepted_price = 0`` on *rejected* orders, so
+    reading it off ``orderbook[0]`` reports a zero price whenever the unit is out of
+    merit. That silently zeroes the opportunity-cost term exactly when it is meant to
+    bite, making full withholding look costless. Prefer the price on an accepted order
+    and fall back to the exogenous price forecast when nothing was accepted.
+    """
+    for order in orderbook:
+        volume = order.get("accepted_volume", 0)
+        price = order.get("accepted_price", 0)
+        if isinstance(volume, dict):
+            volume = volume.get(start, 0)
+        if isinstance(price, dict):
+            price = price.get(start, 0)
+        if volume:
+            return float(price)
+
+    return float(unit.forecaster.price[market_id].at[start])
+
+
 class TorchLearningStrategy(LearningStrategy):
     """
     A strategy to enable machine learning with pytorch.
@@ -381,6 +405,10 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         foresight = kwargs.pop("foresight", 12)
         act_dim = kwargs.pop("act_dim", 2)
         unique_obs_dim = kwargs.pop("unique_obs_dim", 2)
+        # Regret weighting is exposed so it can be ablated from configuration alone.
+        self.regret_weight = float(kwargs.pop("regret_weight", 1.0))
+        self.regret_scale_dispatched = float(kwargs.pop("regret_scale_dispatched", 0.1))
+        self.regret_scale_idle = float(kwargs.pop("regret_scale_idle", 0.5))
         super().__init__(
             foresight=foresight,
             act_dim=act_dim,
@@ -601,7 +629,9 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         marginal_cost = unit.calculate_marginal_cost(
             start, unit.outputs[product_type].at[start]
         )
-        market_clearing_price = orderbook[0]["accepted_price"]
+        market_clearing_price = resolve_clearing_price(
+            unit, marketconfig.market_id, orderbook, start
+        )
 
         duration = (end - start) / timedelta(hours=1)
 
@@ -677,7 +707,11 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         # Dynamic regret scaling:
         # - If accepted volume is positive, apply lower regret (0.1) to avoid punishment for being on the edge of the merit order.
         # - If no dispatch happens, apply higher regret (0.5) to discourage idle behavior, if it could have been profitable.
-        regret_scale = 0.1 if accepted_volume_total > unit.min_power else 0.5
+        regret_scale = (
+            self.regret_scale_dispatched
+            if accepted_volume_total > unit.min_power
+            else self.regret_scale_idle
+        )
 
         # --------------------
         # 4.1 Calculate Reward
@@ -686,7 +720,7 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
 
         # scaling factor to normalize the reward to the range [-1,1]
         scaling = 1 / (self.max_bid_price * unit.max_power)
-        regret = regret_scale * opportunity_cost
+        regret = self.regret_weight * regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
         # Foreign units (the paired scenario's superset, forced off for staggered
@@ -1046,7 +1080,13 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
     **kwargs : Arbitrary keyword arguments.
     """
 
-    def __init__(self, *args, storage_bid_price_limit: float | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        storage_bid_price_limit: float | None = None,
+        soc_value_weight: float = 1.0,
+        **kwargs,
+    ):
         # 'foresight' represents the number of time steps into the future that we will consider
         # when constructing the observations.
         foresight = kwargs.pop("foresight", 24)
@@ -1072,6 +1112,12 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
                 f"{storage_bid_price_limit} > {self.max_bid_price}."
             )
         self.storage_bid_price_limit = storage_bid_price_limit
+        if not np.isfinite(soc_value_weight) or soc_value_weight < 0:
+            raise ValueError(
+                "soc_value_weight must be a finite non-negative number, got "
+                f"{soc_value_weight}."
+            )
+        self.soc_value_weight = float(soc_value_weight)
 
     def get_individual_observations(
         self, unit: SupportsMinMaxCharge, start: datetime, end: datetime
@@ -1287,10 +1333,22 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
 
         profit = order_profit - order_cost
 
+        # Cash profit alone makes charging strictly loss-making and idling strictly
+        # better, so a myopic reward can never favour buying energy. Crediting the
+        # change in the value of stored energy turns the reward into an accrual margin:
+        # charging nets out to roughly zero, discharging earns price minus the cost of
+        # the energy released. Set soc_value_weight=0 to recover the cash-only reward.
+        inventory_value_change = (
+            unit.outputs["cost_stored_energy"].at[next_time] * next_soc
+            - unit.outputs["cost_stored_energy"].at[start] * current_soc
+        ) * unit.capacity
+
         # scaling factor to normalize the reward to the range [-1,1]
         scaling_factor = 1 / (self.max_bid_price * unit.max_power_discharge)
 
-        reward += scaling_factor * profit
+        reward += scaling_factor * (
+            profit + self.soc_value_weight * inventory_value_change
+        )
 
         # Store results in unit outputs
         # Note: these are not learning-specific results but stored for all units for analysis
@@ -1455,7 +1513,9 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         marginal_cost = unit.calculate_marginal_cost(
             start, unit.outputs[product_type].at[start]
         )
-        market_clearing_price = orderbook[0]["accepted_price"]
+        market_clearing_price = resolve_clearing_price(
+            unit, marketconfig.market_id, orderbook, start
+        )
 
         duration = (end - start) / timedelta(hours=1)
 
@@ -1523,7 +1583,11 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         # Dynamic regret scaling:
         # - If accepted volume is positive, apply lower regret (0.1) to avoid punishment for being on the edge of the merit order.
         # - If no dispatch happens, apply higher regret (0.5) to discourage idle behavior, if it could have been profitable.
-        regret_scale = 0.1 if accepted_volume_total > unit.min_power else 0.5
+        regret_scale = (
+            self.regret_scale_dispatched
+            if accepted_volume_total > unit.min_power
+            else self.regret_scale_idle
+        )
 
         # --------------------
         # 4.1 Calculate Reward
@@ -1536,7 +1600,7 @@ class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
         else:
             scaling = 1 / (self.max_bid_price * available_power)
 
-        regret = regret_scale * opportunity_cost
+        regret = self.regret_weight * regret_scale * opportunity_cost
         reward = scaling * (profit - regret)
 
         # Foreign units (the paired scenario's superset, forced off for staggered
@@ -1749,7 +1813,9 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         marginal_cost = unit.calculate_marginal_cost(
             start, unit.outputs[product_type].at[start]
         )
-        market_clearing_price = orderbook[0]["accepted_price"]
+        market_clearing_price = resolve_clearing_price(
+            unit, marketconfig.market_id, orderbook, start
+        )
 
         duration = (end - start) / timedelta(hours=1)
 
