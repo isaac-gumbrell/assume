@@ -921,7 +921,7 @@ def min_max_scale(x, min_val: float, max_val: float):
     """
     # Avoid division by zero
     if min_val == max_val:
-        return x
+        return x - min_val
     return (x - min_val) / (max_val - min_val)
 
 

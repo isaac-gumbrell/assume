@@ -25,6 +25,7 @@ from assume.common.utils import (
     get_supported_solver_pyomo,
     initializer,
     load_index_file,
+    min_max_scale,
     parse_duration,
     plot_orderbook,
     separate_orders,
@@ -68,6 +69,18 @@ def test_reproducability_with_seed():
     assert not np.array_equal(rand_nums_1_1, rand_nums_3), (
         "Random numbers should differ for different seeds"
     )
+
+
+def test_min_max_scale_constant_values_to_zero():
+    values = np.full(3, 40.0)
+
+    assert np.array_equal(min_max_scale(values, 40.0, 40.0), np.zeros(3))
+
+
+def test_min_max_scale_non_constant_values():
+    values = np.array([10.0, 15.0, 20.0])
+
+    assert np.array_equal(min_max_scale(values, 10.0, 20.0), [0.0, 0.5, 1.0])
 
 
 def test_make_market_config():
