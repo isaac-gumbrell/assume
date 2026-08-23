@@ -1003,6 +1003,10 @@ def load_config_and_create_forecaster(
         if uid in unit_forecasts:
             unit_forecasts[uid].is_foreign = True
 
+    price_forecast_source = config.get("price_forecast_source", "auto")
+    for unit_forecaster in unit_forecasts.values():
+        unit_forecaster.price_forecast_source = price_forecast_source
+
     return {
         "config": config,
         "simulation_id": simulation_id,

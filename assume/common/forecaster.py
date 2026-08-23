@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 ForecastIndex: TypeAlias = FastIndex | pd.DatetimeIndex | pd.Series
 ForecastSeries: TypeAlias = FastSeries | list | float | pd.Series
+PRICE_FORECAST_SOURCES = {"auto", "nodal_csv", "market_csv", "naive"}
 
 log = logging.getLogger(__name__)
 
@@ -44,18 +45,26 @@ def calculate_base_forecasts(
     forecast_df: ForecastSeries = None,
     preprocess_information=None,
     prefix="",
+    unit_node: str | None = None,
+    price_forecast_source: str = "auto",
 ) -> dict[str, ForecastSeries]:
     """Compute per-market forecasts for a single metric (e.g. price, residual_load).
 
     For each energy market in *market_configs*, returns the corresponding column
-    from *forecast_df* if it exists (keyed as ``{prefix}_{market_id}``), otherwise
-    falls back to *forecast_algorithm* to calculate the forecast.
+    from *forecast_df*. ``price_forecast_source`` controls whether node, market, or
+    calculated values are used. ``auto`` tries node then market before calculating.
 
     Returns:
         dict[str, ForecastSeries]: Map of ``market_id`` to forecast series.
     """
     # print(prefix, hash(prefix), hash(index), hash(market_configs), hash(units), hash(preprocess_information))
     forecast_df = _ensure_not_none(forecast_df, index)
+
+    if price_forecast_source not in PRICE_FORECAST_SOURCES:
+        raise ValueError(
+            f"Unknown price_forecast_source '{price_forecast_source}'. Expected one "
+            f"of {sorted(PRICE_FORECAST_SOURCES)}."
+        )
 
     forecast: dict[str, pd.Series] = {}
 
@@ -67,8 +76,33 @@ def calculate_base_forecasts(
             )
             continue
 
-        # NOTE: if given forecast_df will currently always prevent other forecast calculations
-        forecast[market_id] = forecast_df.get(f"{prefix}_{market_id}")
+        forecast[market_id] = None
+        if price_forecast_source == "nodal_csv":
+            if not unit_node:
+                raise ValueError(
+                    "price_forecast_source 'nodal_csv' requires an initializing "
+                    "unit with a node."
+                )
+            column = f"{prefix}_{unit_node}"
+            forecast[market_id] = forecast_df.get(column)
+            if forecast[market_id] is None:
+                raise ValueError(
+                    f"price_forecast_source 'nodal_csv' requires column '{column}' "
+                    "in forecasts_df.csv."
+                )
+        elif price_forecast_source == "market_csv":
+            column = f"{prefix}_{market_id}"
+            forecast[market_id] = forecast_df.get(column)
+            if forecast[market_id] is None:
+                raise ValueError(
+                    f"price_forecast_source 'market_csv' requires column '{column}' "
+                    "in forecasts_df.csv."
+                )
+        elif price_forecast_source == "auto":
+            if unit_node:
+                forecast[market_id] = forecast_df.get(f"{prefix}_{unit_node}")
+            if forecast[market_id] is None:
+                forecast[market_id] = forecast_df.get(f"{prefix}_{market_id}")
         if forecast[market_id] is not None:
             # go next if forecast existing
             continue
@@ -193,6 +227,7 @@ class UnitForecaster:
             )
         self.forecast_algorithms = forecast_algorithms
         self._registries = forecast_registries
+        self.price_forecast_source = "auto"
         if market_prices is None:
             market_prices = {"EOM": 50}  # default value for tests
         if residual_load is None:
@@ -331,6 +366,8 @@ class UnitForecaster:
                 forecast_df,
                 self.preprocess_information["price"],
                 prefix="price",
+                unit_node=(initializing_unit.node if initializing_unit else None),
+                price_forecast_source=self.price_forecast_source,
             )
             self.price = self._dict_to_series(self.price)
 

@@ -334,6 +334,98 @@ def test_forecast_interface__uses_given_forecast(index, market_setup, forecast_s
     assert list(rn_utilization["all_nodes_renewable_utilisation"]) == [1.0] * len(index)
 
 
+def test_forecast_interface__uses_price_forecast_for_unit_node(
+    index, market_setup, forecast_setup
+):
+    forecasts = forecast_setup["forecast_df"].copy()
+    units_by_node = {}
+    for unit in forecast_setup["units"]:
+        units_by_node.setdefault(unit.node, unit)
+
+    first_node, second_node = list(units_by_node)[:2]
+    forecasts[f"price_{first_node}"] = pd.Series(11.0, index=index)
+    forecasts[f"price_{second_node}"] = pd.Series(22.0, index=index)
+
+    for node, expected_price in [(first_node, 11.0), (second_node, 22.0)]:
+        unit = units_by_node[node]
+        unit.forecaster.price_forecast_source = "nodal_csv"
+        unit.forecaster.initialize(
+            forecast_setup["units"],
+            market_setup["market_configs"],
+            forecasts,
+            unit,
+        )
+        assert list(unit.forecaster.price["EOM"]) == [expected_price] * len(index)
+
+
+def test_forecast_interface__nodal_price_requires_unit_column(
+    market_setup, forecast_setup
+):
+    unit = next(iter(forecast_setup["units"]))
+    unit.forecaster.price_forecast_source = "nodal_csv"
+
+    with pytest.raises(ValueError, match=f"price_{unit.node}"):
+        unit.forecaster.initialize(
+            forecast_setup["units"],
+            market_setup["market_configs"],
+            forecast_setup["forecast_df"],
+            unit,
+        )
+
+
+def test_forecast_interface__market_price_source_ignores_node_column(
+    index, market_setup, forecast_setup
+):
+    unit = next(iter(forecast_setup["units"]))
+    forecasts = forecast_setup["forecast_df"].copy()
+    forecasts[f"price_{unit.node}"] = pd.Series(999.0, index=index)
+    unit.forecaster.price_forecast_source = "market_csv"
+
+    unit.forecaster.initialize(
+        forecast_setup["units"],
+        market_setup["market_configs"],
+        forecasts,
+        unit,
+    )
+
+    assert list(unit.forecaster.price["EOM"]) == list(forecasts["price_EOM"])
+
+
+def test_forecast_interface__naive_price_source_ignores_csv(
+    index, market_setup, forecast_setup
+):
+    unit = next(iter(forecast_setup["units"]))
+    forecasts = forecast_setup["forecast_df"].copy()
+    forecasts["price_EOM"] = pd.Series(999.0, index=index)
+    forecasts[f"price_{unit.node}"] = pd.Series(999.0, index=index)
+    expected_price = pd.read_csv(path / "results/price.csv", **parse_date)["price"]
+    unit.forecaster.price_forecast_source = "naive"
+
+    unit.forecaster.initialize(
+        forecast_setup["units"],
+        market_setup["market_configs"],
+        forecasts,
+        unit,
+    )
+
+    assert list(unit.forecaster.price["EOM"]) == list(expected_price)
+
+
+def test_forecast_interface__rejects_unknown_price_source(
+    market_setup, forecast_setup
+):
+    unit = next(iter(forecast_setup["units"]))
+    unit.forecaster.price_forecast_source = "unknown"
+
+    with pytest.raises(ValueError, match="Unknown price_forecast_source"):
+        unit.forecaster.initialize(
+            forecast_setup["units"],
+            market_setup["market_configs"],
+            forecast_setup["forecast_df"],
+            unit,
+        )
+
+
 def test_forecast_interface__empty_grid(market_setup, forecast_setup):
     mock_dsm_forecaster = forecast_setup["mock_dsm_forecaster"]
 
