@@ -19,6 +19,7 @@ try:
         EnergyLearningStrategy,
         EnergyLearningStrategyCongestion,
         RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategyCongestion,
         SRMCEnergyLearningStrategy,
         SRMCEnergyLearningStrategyCongestion,
@@ -32,6 +33,7 @@ except ImportError:
     EnergyLearningSingleBidStrategyCongestion = None
     StorageEnergyLearningStrategyCongestion = None
     RenewableEnergyLearningCompatibleStrategy = None
+    RenewableEnergyLearningCompatibleStrategyCongestion = None
     RenewableEnergyLearningSingleBidStrategyCongestion = None
     SRMCEnergyLearningStrategy = None
     SRMCEnergyLearningStrategyCongestion = None
@@ -241,7 +243,10 @@ def _make_srmc_learning_role(
 
 def _build_srmc_strategy(strategy_class, learning_role, config):
     """Instantiate an SRMC strategy, supplying congestion kwargs when required."""
-    if issubclass(strategy_class, SRMCEnergyLearningStrategyCongestion):
+    if strategy_class in (
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ):
         return strategy_class(
             learning_role=learning_role,
             n_lines=3,
@@ -254,7 +259,12 @@ def _build_srmc_strategy(strategy_class, learning_role, config):
 @pytest.mark.require_learning
 @pytest.mark.parametrize(
     "strategy_class",
-    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+    [
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ],
 )
 @pytest.mark.parametrize(
     "action_value, expected_fraction",
@@ -313,7 +323,12 @@ def test_srmc_bid_price_remap(
 @pytest.mark.require_learning
 @pytest.mark.parametrize(
     "strategy_class",
-    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+    [
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ],
 )
 def test_srmc_upper_bound_floor_allows_zero_cost_markup(
     mock_market_config,
@@ -400,7 +415,12 @@ def test_srmc_get_actions_has_no_marginal_cost_bias():
 @pytest.mark.require_learning
 @pytest.mark.parametrize(
     "strategy_class",
-    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+    [
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ],
 )
 @pytest.mark.parametrize(
     "missing_parameter",
@@ -418,7 +438,12 @@ def test_srmc_bound_parameters_required(strategy_class, missing_parameter):
 @pytest.mark.require_learning
 @pytest.mark.parametrize(
     "strategy_class",
-    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+    [
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ],
 )
 @pytest.mark.parametrize(
     "invalid_multiplier", [0.5, 0.0, -1.0, float("nan"), float("inf")]
@@ -434,7 +459,12 @@ def test_srmc_multiplier_validation(strategy_class, invalid_multiplier):
 @pytest.mark.require_learning
 @pytest.mark.parametrize(
     "strategy_class",
-    [SRMCEnergyLearningStrategy, SRMCEnergyLearningStrategyCongestion],
+    [
+        SRMCEnergyLearningStrategy,
+        SRMCEnergyLearningStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategy,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
+    ],
 )
 @pytest.mark.parametrize("invalid_floor", [-1.0, float("nan"), float("inf")])
 def test_srmc_upper_bound_floor_validation(strategy_class, invalid_floor):
@@ -465,7 +495,10 @@ def _make_congestion_strategy(
     strategy_class, n_lines, congestion_foresight, learning_role
 ):
     extra_kwargs = {}
-    if issubclass(strategy_class, SRMCEnergyLearningStrategy):
+    if issubclass(
+        strategy_class,
+        (SRMCEnergyLearningStrategy, RenewableEnergyLearningCompatibleStrategy),
+    ):
         extra_kwargs["srmc_multiplier"] = 1.4
         extra_kwargs["srmc_upper_bound_floor"] = 200.0
     return strategy_class(
@@ -491,6 +524,7 @@ def _make_congestion_strategy(
         SRMCEnergyLearningStrategyCongestion,
         StorageEnergyLearningStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategyCongestion,
+        RenewableEnergyLearningCompatibleStrategyCongestion,
     ],
 )
 def test_congestion_obs_dim(strategy_class):
@@ -680,6 +714,8 @@ def test_activity_mask_keys_off_foreign_flag_not_availability(
         unit_id=unit_id,
         learning_config=config,
         learning_role=lr,
+        srmc_multiplier=1.4,
+        srmc_upper_bound_floor=200.0,
     )
 
     power_plant = PowerPlant(

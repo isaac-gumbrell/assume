@@ -26,6 +26,36 @@ from assume.reinforcement_learning.learning_utils import NormalActionNoise
 logger = logging.getLogger(__name__)
 
 
+def validate_srmc_action_bounds(
+    srmc_multiplier: float, srmc_upper_bound_floor: float
+) -> None:
+    """Validate configuration for the SRMC-bounded bid action space."""
+    if not np.isfinite(srmc_multiplier) or srmc_multiplier < 1:
+        raise ValueError(
+            f"srmc_multiplier must be a finite number >= 1, got {srmc_multiplier}."
+        )
+    if not np.isfinite(srmc_upper_bound_floor) or srmc_upper_bound_floor < 0:
+        raise ValueError(
+            "srmc_upper_bound_floor must be a finite non-negative number, got "
+            f"{srmc_upper_bound_floor}."
+        )
+
+
+def calculate_srmc_action_bounds(
+    srmc: float,
+    max_bid_price: float,
+    srmc_multiplier: float,
+    srmc_upper_bound_floor: float,
+) -> tuple[float, float]:
+    """Return the lower and upper prices for an SRMC-bounded bid action."""
+    lower_bound = min(max(srmc, 0.0), max_bid_price)
+    upper_bound = min(
+        max(lower_bound * srmc_multiplier, srmc_upper_bound_floor),
+        max_bid_price,
+    )
+    return lower_bound, upper_bound
+
+
 def resolve_clearing_price(
     unit: BaseUnit, market_id: str, orderbook: Orderbook, start: datetime
 ) -> float:
@@ -865,9 +895,8 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     bids and focuses the learning signal on choosing the profit-maximising markup. Bounding
     the upper end of the action range to a multiple of SRMC (rather than the global
     ``max_bid_price``) shrinks the action space to the economically relevant region for
-    each unit. This mirrors the bounded remapping used in
-    ``RenewableEnergyLearningCompatibleStrategy`` (which remaps to ``[0, max_bid_price]``
-    for near-zero-cost renewables).
+    each unit. The same bounded remapping is used in
+    ``RenewableEnergyLearningCompatibleStrategy``.
 
     The observation structure, actor network architecture, and reward formulation are
     inherited unchanged from ``EnergyLearningSingleBidStrategy``.
@@ -899,15 +928,7 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         srmc_upper_bound_floor: float,
         **kwargs,
     ):
-        if not np.isfinite(srmc_multiplier) or srmc_multiplier < 1:
-            raise ValueError(
-                f"srmc_multiplier must be a finite number >= 1, got {srmc_multiplier}."
-            )
-        if not np.isfinite(srmc_upper_bound_floor) or srmc_upper_bound_floor < 0:
-            raise ValueError(
-                "srmc_upper_bound_floor must be a finite non-negative number, got "
-                f"{srmc_upper_bound_floor}."
-            )
+        validate_srmc_action_bounds(srmc_multiplier, srmc_upper_bound_floor)
         self.srmc_multiplier = srmc_multiplier
         self.srmc_upper_bound_floor = srmc_upper_bound_floor
         super().__init__(*args, **kwargs)
@@ -956,14 +977,11 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
 
         # short-run marginal cost of producing at the available capacity; this is the
         # lower bound of the bid range so the unit never bids below cost.
-        srmc = unit.calculate_marginal_cost(start, max_power)
-        # keep SRMC within the valid bid range to guarantee a well-defined remap.
-        srmc = min(max(srmc, 0.0), self.max_bid_price)
-        # The absolute floor preserves price-setting capability for zero- and low-SRMC
-        # units. The global max_bid_price remains the final safety cap.
-        upper_bound = min(
-            max(srmc * self.srmc_multiplier, self.srmc_upper_bound_floor),
+        srmc, upper_bound = calculate_srmc_action_bounds(
+            unit.calculate_marginal_cost(start, max_power),
             self.max_bid_price,
+            self.srmc_multiplier,
+            self.srmc_upper_bound_floor,
         )
 
         # =============================================================================
@@ -1642,9 +1660,10 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         - ``scaled_total_dispatch``  – current output / max_power
         - ``scaled_available_power`` – available power / max_power
 
-    The ``calculate_reward`` method uses renewable-specific opportunity-cost logic
-    (based on available generation rather than installed capacity), identical to
-    ``RenewableEnergyLearningSingleBidStrategy``.
+    Bid actions use the same SRMC-bounded interval as
+    ``SRMCEnergyLearningStrategy``. The ``calculate_reward`` method uses
+    renewable-specific opportunity-cost logic (based on available generation rather
+    than installed capacity), identical to ``RenewableEnergyLearningSingleBidStrategy``.
 
     Attributes
     ----------
@@ -1654,9 +1673,23 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         Action dimension (single bid price).  Default 1.
     unique_obs_dim : int
         Unit-specific observation dimension.  Fixed at 2 for critic compatibility.
+
+    Args:
+        srmc_multiplier (float): Factor applied to SRMC to obtain the upper bid bound.
+        srmc_upper_bound_floor (float): Absolute floor for the upper bid bound.
+        **kwargs: Forwarded to :class:`EnergyLearningSingleBidStrategy`.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        srmc_multiplier: float,
+        srmc_upper_bound_floor: float,
+        **kwargs,
+    ):
+        validate_srmc_action_bounds(srmc_multiplier, srmc_upper_bound_floor)
+        self.srmc_multiplier = srmc_multiplier
+        self.srmc_upper_bound_floor = srmc_upper_bound_floor
         foresight = kwargs.pop("foresight", 24)
         act_dim = kwargs.pop("act_dim", 1)
         # Default unique_obs_dim=2 so obs_dim matches storage/generator strategies.
@@ -1725,9 +1758,8 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         """
         Generates a single price bid for the full available capacity (max_power).
 
-        Overrides the parent to remap the action space from [-1, 1] to [0, max_bid_price]
-        instead of [-max_bid_price, +max_bid_price]. This prevents negative bids, which
-        are not meaningful for renewable units with near-zero marginal cost.
+        Overrides the parent to use the same SRMC-bounded action remap as
+        :class:`SRMCEnergyLearningStrategy`.
 
         Returns
         -------
@@ -1740,6 +1772,12 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         # get technical bounds for the unit output from the unit
         _, max_power = unit.calculate_min_max_power(start, end)
         max_power = max_power[0]
+        srmc, upper_bound = calculate_srmc_action_bounds(
+            unit.calculate_marginal_cost(start, max_power),
+            self.max_bid_price,
+            self.srmc_multiplier,
+            self.srmc_upper_bound_floor,
+        )
 
         # =============================================================================
         # 1. Get the Observations, which are the basis of the action decision
@@ -1759,10 +1797,7 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         # =============================================================================
         # 3. Transform Actions into bids
         # =============================================================================
-        # Remap from [-1, 1] to [0, max_bid_price] for renewables.
-        # A linear remap (instead of clamping) preserves full gradient resolution
-        # across the valid bid range.
-        bid_price = ((actions[0] + 1) / 2) * self.max_bid_price
+        bid_price = srmc + ((actions[0] + 1) / 2) * (upper_bound - srmc)
 
         # actually formulate bids in orderbook format
         bids = [
@@ -2062,5 +2097,7 @@ class RenewableEnergyLearningCompatibleStrategyCongestion(
     Args:
         n_lines (int): Number of transmission lines (required).
         congestion_foresight (int): Window length for congestion channels. Default 1.
+        srmc_multiplier (float): Factor applied to SRMC to obtain the upper bid bound.
+        srmc_upper_bound_floor (float): Absolute floor for the upper bid bound.
         **kwargs: Forwarded to :class:`RenewableEnergyLearningCompatibleStrategy`.
     """
