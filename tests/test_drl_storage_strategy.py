@@ -15,7 +15,11 @@ try:
     import torch as th
 
     from assume.reinforcement_learning import Learning
-    from assume.strategies.learning_strategies import StorageEnergyLearningStrategy
+    from assume.strategies.learning_strategies import (
+        StorageEnergyLearningHeuristicStrategy,
+        StorageEnergyLearningHeuristicStrategyCongestion,
+        StorageEnergyLearningStrategy,
+    )
 except ImportError:
     th = None
 
@@ -78,6 +82,87 @@ def mock_market_config():
     mc.market_id = "test_market"
     mc.product_type = "energy"
     return mc
+
+
+def _heuristic_learning_strategy(storage_unit):
+    current_strategy = storage_unit.bidding_strategies["test_market"]
+    return StorageEnergyLearningHeuristicStrategy(
+        learning_role=current_strategy.learning_role,
+        unit_id=storage_unit.id,
+        storage_bid_price_limit=2_000,
+    )
+
+
+@pytest.mark.require_learning
+def test_storage_heuristic_congestion_dimensions_match_production(storage_unit):
+    current_strategy = storage_unit.bidding_strategies["test_market"]
+    strategy = StorageEnergyLearningHeuristicStrategyCongestion(
+        learning_role=current_strategy.learning_role,
+        unit_id=storage_unit.id,
+        storage_bid_price_limit=2_000,
+        n_lines=47,
+        foresight=24,
+    )
+
+    assert strategy.obs_dim == 121
+    assert strategy.unique_obs_dim == 2
+    assert strategy.act_dim == 1
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "volume, action, expected_price",
+    [
+        (100.0, -1.0, 0.0),
+        (100.0, 0.0, 500.0),
+        (100.0, 1.0, 2_000.0),
+        (-100.0, -1.0, 2_000.0),
+        (-100.0, 0.0, 500.0),
+        (-100.0, 1.0, 0.0),
+    ],
+)
+def test_storage_heuristic_action_has_consistent_withholding_meaning(
+    storage_unit, volume, action, expected_price
+):
+    strategy = _heuristic_learning_strategy(storage_unit)
+
+    assert strategy.adjust_heuristic_price(500.0, volume, action) == pytest.approx(
+        expected_price
+    )
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "prices, expected_volume_sign",
+    [([60.0, 50.0, 50.0, 50.0], 1), ([40.0, 50.0, 50.0, 50.0], -1)],
+)
+def test_storage_heuristic_zero_action_reproduces_backbone_bid(
+    mock_market_config, storage_unit, prices, expected_volume_sign
+):
+    product_start = pd.Timestamp("2023-07-01")
+    product_tuples = [(product_start, product_start + pd.Timedelta(hours=1), None)]
+    storage_unit.forecaster = UnitForecaster(
+        pd.date_range(product_start, periods=4, freq="h"),
+        market_prices={"test_market": prices},
+    )
+    strategy = _heuristic_learning_strategy(storage_unit)
+    heuristic_bids = strategy.heuristic_strategy.calculate_bids(
+        storage_unit, mock_market_config, product_tuples
+    )
+
+    with patch.object(
+        strategy,
+        "get_actions",
+        return_value=(th.tensor([0.0]), th.tensor([0.0])),
+    ):
+        learning_bids = strategy.calculate_bids(
+            storage_unit, mock_market_config, product_tuples
+        )
+
+    assert len(learning_bids) == len(heuristic_bids) == 1
+    assert learning_bids[0]["price"] == pytest.approx(heuristic_bids[0]["price"])
+    assert learning_bids[0]["volume"] == pytest.approx(heuristic_bids[0]["volume"])
+    assert math.copysign(1, learning_bids[0]["volume"]) == expected_volume_sign
 
 
 @pytest.mark.require_learning

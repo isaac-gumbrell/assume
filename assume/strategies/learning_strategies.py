@@ -5,6 +5,7 @@
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch as th
@@ -22,6 +23,7 @@ from assume.common.market_objects import MarketConfig, Orderbook, Product
 from assume.common.utils import min_max_scale
 from assume.reinforcement_learning.algorithms import actor_architecture_aliases
 from assume.reinforcement_learning.learning_utils import NormalActionNoise
+from assume.strategies.flexable_storage import StorageEnergyHeuristicFlexableStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -1386,6 +1388,96 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
             )
 
 
+class StorageEnergyLearningHeuristicStrategy(StorageEnergyLearningStrategy):
+    """Learn bid aggressiveness around a heuristic storage schedule.
+
+    The heuristic selects charge/discharge mode, feasible volume, and a competitive
+    reservation price. The actor controls only a bounded price adjustment. Action zero
+    reproduces the heuristic, negative actions increase clearing probability, and
+    positive actions withhold. Reward calculation remains inventory-value based through
+    :class:`StorageEnergyLearningStrategy`.
+    """
+
+    def __init__(
+        self,
+        *args,
+        heuristic_foresight: str = "12h",
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.heuristic_strategy = StorageEnergyHeuristicFlexableStrategy(
+            eom_foresight=heuristic_foresight
+        )
+
+    def adjust_heuristic_price(
+        self, baseline_price: float, volume: float, action: float
+    ) -> float:
+        """Map an actor action to a bounded adjustment around a heuristic price."""
+        action = float(np.clip(action, -1.0, 1.0))
+        price_limit = cast(float, self.storage_bid_price_limit)
+        baseline_price = float(np.clip(baseline_price, 0.0, price_limit))
+
+        if volume > 0:
+            target_price = price_limit if action >= 0 else 0.0
+        elif volume < 0:
+            target_price = 0.0 if action >= 0 else price_limit
+        else:
+            return baseline_price
+
+        return baseline_price + abs(action) * (target_price - baseline_price)
+
+    @staticmethod
+    def _scalar_order_value(value: Any, field: str) -> float:
+        if isinstance(value, dict):
+            raise ValueError(
+                "StorageEnergyLearningHeuristicStrategy does not support "
+                f"dictionary-valued {field}."
+            )
+        return float(value)
+
+    def calculate_bids(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_config: MarketConfig,
+        product_tuples: list[Product],
+        **kwargs,
+    ) -> Orderbook:
+        if len(product_tuples) != 1:
+            raise ValueError(
+                "StorageEnergyLearningHeuristicStrategy requires exactly one product "
+                "per market opening."
+            )
+
+        bids = self.heuristic_strategy.calculate_bids(
+            unit, market_config, product_tuples, **kwargs
+        )
+        if not bids:
+            return bids
+
+        start, end = product_tuples[0][0], product_tuples[0][1]
+        observation = self.create_observation(
+            unit=unit,
+            market_id=market_config.market_id,
+            start=start,
+            end=end,
+        )
+        actions, noise = self.get_actions(observation)
+        action = float(actions[0].detach().cpu())
+
+        for bid in bids:
+            adjusted_price = self.adjust_heuristic_price(
+                baseline_price=self._scalar_order_value(bid["price"], "price"),
+                volume=self._scalar_order_value(bid["volume"], "volume"),
+                action=action,
+            )
+            bid["price"] = cast(Any, adjusted_price)
+
+        if self.learning_mode:
+            self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
+
+        return bids
+
+
 class RenewableEnergyLearningSingleBidStrategy(EnergyLearningSingleBidStrategy):
     """
     Reinforcement Learning Strategy for a renewable unit that enables the agent to learn
@@ -2075,6 +2167,12 @@ class StorageEnergyLearningStrategyCongestion(
         congestion_foresight (int): Window length for congestion channels. Default 1.
         **kwargs: Forwarded to :class:`StorageEnergyLearningStrategy`.
     """
+
+
+class StorageEnergyLearningHeuristicStrategyCongestion(
+    _CongestionObsMixin, StorageEnergyLearningHeuristicStrategy
+):
+    """Heuristic-backed storage learning with per-line congestion observations."""
 
 
 class RenewableEnergyLearningSingleBidStrategyCongestion(

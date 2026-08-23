@@ -106,6 +106,8 @@ try:
         SRMCEnergyLearningStrategyCongestion,
         StorageEnergyLearningStrategy,
         StorageEnergyLearningStrategyCongestion,
+        StorageEnergyLearningHeuristicStrategy,
+        StorageEnergyLearningHeuristicStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategy,
         RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
@@ -125,6 +127,9 @@ try:
     )
     bidding_strategies["powerplant_energy_learning_srmc"] = SRMCEnergyLearningStrategy
     bidding_strategies["storage_energy_learning"] = StorageEnergyLearningStrategy
+    bidding_strategies["storage_energy_learning_heuristic"] = (
+        StorageEnergyLearningHeuristicStrategy
+    )
     bidding_strategies["renewable_energy_learning_single_bid"] = (
         RenewableEnergyLearningSingleBidStrategy
     )
@@ -142,6 +147,9 @@ try:
     )
     bidding_strategies["storage_energy_learning_congestion"] = (
         StorageEnergyLearningStrategyCongestion
+    )
+    bidding_strategies["storage_energy_learning_heuristic_congestion"] = (
+        StorageEnergyLearningHeuristicStrategyCongestion
     )
     bidding_strategies["renewable_energy_learning_single_bid_congestion"] = (
         RenewableEnergyLearningSingleBidStrategyCongestion
