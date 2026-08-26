@@ -345,13 +345,14 @@ def make_market_config(
     return market_config
 
 
-def read_grid(network_path: str | Path) -> dict[str, pd.DataFrame | None]:
+def read_grid(
+    network_path: str | Path, storage_units: pd.DataFrame | None = None
+) -> dict[str, pd.DataFrame | None]:
     network_path = Path(network_path)
     buses = None
     lines = None
     generators = None
     loads = None
-    storage_units = None
 
     if (network_path / "buses.csv").exists():
         buses = pd.read_csv(network_path / "buses.csv", index_col=0)
@@ -361,7 +362,7 @@ def read_grid(network_path: str | Path) -> dict[str, pd.DataFrame | None]:
         generators = pd.read_csv(network_path / "powerplant_units.csv", index_col=0)
     if (network_path / "demand_units.csv").exists():
         loads = pd.read_csv(network_path / "demand_units.csv", index_col=0)
-    if (network_path / "storage_units.csv").exists():
+    if storage_units is None and (network_path / "storage_units.csv").exists():
         storage_units = pd.read_csv(network_path / "storage_units.csv", index_col=0)
 
     return {
@@ -1152,7 +1153,9 @@ def setup_world(
             world_end=end,
         )
         if "network_path" in market_config.param_dict.keys():
-            grid_data = read_grid(market_config.param_dict["network_path"])
+            grid_data = read_grid(
+                market_config.param_dict["network_path"], storage_units=storage_units
+            )
             market_config.param_dict["grid_data"] = grid_data
 
         operator_id = str(market_params["operator"])

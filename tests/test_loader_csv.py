@@ -10,6 +10,7 @@ import pytest
 from assume.scenario.loader_csv import (
     get_unit_forecast_algorithms,
     load_config_and_create_forecaster,
+    read_grid,
     setup_world,
 )
 from assume.world import World
@@ -29,6 +30,21 @@ def test_csv_loader_validation():
         load_config_and_create_forecaster(
             inputs_path="tests/fixtures", scenario="missing_units", study_case="base"
         )
+
+
+def test_read_grid_uses_case_storage_override(tmp_path):
+    storage_override = pd.DataFrame(
+        {
+            "node": ["north"],
+            "max_power_charge": [-100.0],
+            "max_power_discharge": [100.0],
+        },
+        index=["battery_override"],
+    )
+
+    grid_data = read_grid(tmp_path, storage_units=storage_override)
+
+    assert grid_data["storage_units"] is storage_override
 
 
 def test_csv_loader_forecaster_algorithms():
