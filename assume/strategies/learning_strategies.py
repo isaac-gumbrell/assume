@@ -1268,6 +1268,10 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
 
         return bids
 
+    def is_rl_active(self, unit: SupportsMinMaxCharge, start: datetime) -> float:
+        """Return whether the storage actor controlled the bid at ``start``."""
+        return 0.0 if unit.forecaster.is_foreign else 1.0
+
     def calculate_reward(
         self,
         unit: SupportsMinMaxCharge,
@@ -1379,7 +1383,7 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         # training) carry no learning signal and are masked out of the shared policy
         # update. A *native* unit with zero availability this period (e.g. solar at
         # night) is a genuine, learnable state and must stay active.
-        active = 0.0 if unit.forecaster.is_foreign else 1.0
+        active = self.is_rl_active(unit, start)
 
         # write rl-rewards to buffer
         if self.learning_mode:
@@ -2173,6 +2177,172 @@ class StorageEnergyLearningHeuristicStrategyCongestion(
     _CongestionObsMixin, StorageEnergyLearningHeuristicStrategy
 ):
     """Heuristic-backed storage learning with per-line congestion observations."""
+
+
+class StorageEnergyLearningHeuristicDispatchStrategyCongestion(
+    StorageEnergyLearningHeuristicStrategyCongestion
+):
+    """Heuristic storage with deterministic charging and RL-controlled dispatch.
+
+    The flexABLE heuristic chooses the physical mode and feasible volume. Charging
+    submits a fixed, capped demand bid and is recorded as an inactive replay
+    transition. During discharge, one actor action maps linearly from a cost-aware
+    floor to a bounded forecast markup. The replay activity mask and stored action
+    distinguish deterministic charging from actor-controlled dispatch, preserving
+    the standard two-value storage observation tail for shared MATD3 policies.
+    """
+
+    def __init__(
+        self,
+        *args,
+        forecast_multiplier: float = 1.4,
+        forecast_upper_bound_floor: float = 200.0,
+        charge_price_markup: float = 0.0,
+        charge_bid_price_limit: float | None = None,
+        **kwargs,
+    ):
+        if not np.isfinite(forecast_multiplier) or forecast_multiplier < 1:
+            raise ValueError(
+                "forecast_multiplier must be a finite number >= 1, got "
+                f"{forecast_multiplier}."
+            )
+        if (
+            not np.isfinite(forecast_upper_bound_floor)
+            or forecast_upper_bound_floor < 0
+        ):
+            raise ValueError(
+                "forecast_upper_bound_floor must be a finite non-negative number, "
+                f"got {forecast_upper_bound_floor}."
+            )
+        if not np.isfinite(charge_price_markup) or charge_price_markup < 0:
+            raise ValueError(
+                "charge_price_markup must be a finite non-negative number, got "
+                f"{charge_price_markup}."
+            )
+
+        # This policy has exactly one dispatch-price action. Its observation tail
+        # remains the standard storage [SoC, stored-energy cost] pair so it can
+        # share a centralized critic with the existing congestion strategies.
+        kwargs["act_dim"] = 1
+        super().__init__(*args, **kwargs)
+
+        if charge_bid_price_limit is None:
+            charge_bid_price_limit = self.storage_bid_price_limit
+        if (
+            not np.isfinite(charge_bid_price_limit)
+            or charge_bid_price_limit <= 0
+            or charge_bid_price_limit > self.max_bid_price
+        ):
+            raise ValueError(
+                "charge_bid_price_limit must be finite, positive, and no greater "
+                f"than max_bid_price, got {charge_bid_price_limit}."
+            )
+
+        self.forecast_multiplier = float(forecast_multiplier)
+        self.forecast_upper_bound_floor = float(forecast_upper_bound_floor)
+        self.charge_price_markup = float(charge_price_markup)
+        self.charge_bid_price_limit = float(charge_bid_price_limit)
+        self._rl_active_by_start: dict[datetime, bool] = {}
+
+    def _dispatch_price_bounds(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_id: str,
+        start: datetime,
+        volume: float,
+    ) -> tuple[float, float]:
+        forecast_price = float(unit.forecaster.price[market_id].at[start])
+        stored_energy_cost = float(unit.outputs["cost_stored_energy"].at[start])
+        discharge_cost = float(unit.calculate_marginal_cost(start, volume))
+        lower_bound = min(
+            max(forecast_price, stored_energy_cost, discharge_cost, 0.0),
+            self.max_bid_price,
+        )
+        upper_bound = min(
+            max(
+                lower_bound * self.forecast_multiplier,
+                self.forecast_upper_bound_floor,
+            ),
+            self.max_bid_price,
+        )
+        return lower_bound, upper_bound
+
+    def _charge_bid_price(
+        self, unit: SupportsMinMaxCharge, market_id: str, start: datetime
+    ) -> float:
+        forecast_price = float(unit.forecaster.price[market_id].at[start])
+        return min(
+            max(forecast_price + self.charge_price_markup, 0.0),
+            self.charge_bid_price_limit,
+        )
+
+    def is_rl_active(self, unit: SupportsMinMaxCharge, start: datetime) -> float:
+        if unit.forecaster.is_foreign:
+            return 0.0
+        return float(self._rl_active_by_start.get(start, False))
+
+    def calculate_bids(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_config: MarketConfig,
+        product_tuples: list[Product],
+        **kwargs,
+    ) -> Orderbook:
+        if len(product_tuples) != 1:
+            raise ValueError(
+                "StorageEnergyLearningHeuristicDispatchStrategyCongestion requires "
+                "exactly one product per market opening."
+            )
+
+        bids = self.heuristic_strategy.calculate_bids(
+            unit, market_config, product_tuples, **kwargs
+        )
+        if not bids:
+            return bids
+
+        start, end = product_tuples[0][0], product_tuples[0][1]
+        bid = bids[0]
+        volume = self._scalar_order_value(bid["volume"], "volume")
+        is_dispatch = volume > 0
+        self._rl_active_by_start[start] = is_dispatch
+
+        if is_dispatch:
+            observation = self.create_observation(
+                unit=unit,
+                market_id=market_config.market_id,
+                start=start,
+                end=end,
+            )
+            actions, noise = self.get_actions(observation)
+            action = float(actions[0].detach().cpu())
+            lower_bound, upper_bound = self._dispatch_price_bounds(
+                unit, market_config.market_id, start, volume
+            )
+            bid["price"] = lower_bound + ((action + 1) / 2) * (
+                upper_bound - lower_bound
+            )
+        else:
+            charge_price = self._charge_bid_price(unit, market_config.market_id, start)
+            observation = self.create_observation(
+                unit=unit,
+                market_id=market_config.market_id,
+                start=start,
+                end=end,
+            )
+            # This replay action represents the deterministic charge bid. It is
+            # never actor-controlled: ``active=0`` masks its losses and MATD3 uses
+            # the stored value, rather than an actor output, in future targets.
+            action_value = 2 * charge_price / self.max_bid_price - 1
+            actions = th.as_tensor(
+                [action_value], dtype=self.float_type, device=self.device
+            )
+            noise = th.zeros_like(actions)
+            bid["price"] = charge_price
+
+        if self.learning_mode:
+            self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
+
+        return bids
 
 
 class RenewableEnergyLearningSingleBidStrategyCongestion(

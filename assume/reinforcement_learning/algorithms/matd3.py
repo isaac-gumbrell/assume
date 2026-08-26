@@ -540,6 +540,7 @@ class TD3(RLAlgorithm):
             # foreign unit in staggered training). Masked transitions are excluded
             # from each agent's own critic/actor loss so they do not bias the policy.
             masks = transitions.masks
+            next_masks = transitions.next_masks
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
@@ -551,8 +552,11 @@ class TD3(RLAlgorithm):
                     self.learning_config.target_noise_clip,
                 )
 
-                # Select next actions for all agents
-                next_actions = th.stack(
+                # Select next actions for controllable next states. A deterministic
+                # strategy state (for example, storage charging) stores its actual
+                # action in replay and must not be replaced by an actor output that
+                # the environment will never execute.
+                policy_next_actions = th.stack(
                     [
                         (
                             strategy.actor_target(next_states[:, i, :]) + noise[:, i, :]

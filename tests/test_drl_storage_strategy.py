@@ -16,6 +16,8 @@ try:
 
     from assume.reinforcement_learning import Learning
     from assume.strategies.learning_strategies import (
+        SRMCEnergyLearningStrategyCongestion,
+        StorageEnergyLearningHeuristicDispatchStrategyCongestion,
         StorageEnergyLearningHeuristicStrategy,
         StorageEnergyLearningHeuristicStrategyCongestion,
         StorageEnergyLearningStrategy,
@@ -93,6 +95,22 @@ def _heuristic_learning_strategy(storage_unit):
     )
 
 
+def _dispatch_learning_strategy(storage_unit, **kwargs):
+    current_strategy = storage_unit.bidding_strategies["test_market"]
+    n_lines = kwargs.pop("n_lines", 0)
+    return StorageEnergyLearningHeuristicDispatchStrategyCongestion(
+        learning_role=current_strategy.learning_role,
+        unit_id=storage_unit.id,
+        storage_bid_price_limit=2_000,
+        n_lines=n_lines,
+        forecast_multiplier=1.4,
+        forecast_upper_bound_floor=200,
+        charge_price_markup=25,
+        charge_bid_price_limit=500,
+        **kwargs,
+    )
+
+
 @pytest.mark.require_learning
 def test_storage_heuristic_congestion_dimensions_match_production(storage_unit):
     current_strategy = storage_unit.bidding_strategies["test_market"]
@@ -107,6 +125,98 @@ def test_storage_heuristic_congestion_dimensions_match_production(storage_unit):
     assert strategy.obs_dim == 121
     assert strategy.unique_obs_dim == 2
     assert strategy.act_dim == 1
+
+
+@pytest.mark.require_learning
+def test_storage_dispatch_heuristic_congestion_dimensions_match_shared_policy(
+    storage_unit,
+):
+    strategy = _dispatch_learning_strategy(storage_unit, n_lines=47, foresight=24)
+
+    assert strategy.obs_dim == 121
+    assert strategy.unique_obs_dim == 2
+    assert strategy.act_dim == 1
+
+
+@pytest.mark.require_learning
+def test_storage_dispatch_policy_shares_matd3_dimensions_with_srmc_congestion(
+    storage_unit,
+):
+    storage_strategy = _dispatch_learning_strategy(storage_unit, n_lines=47, foresight=24)
+    SRMCEnergyLearningStrategyCongestion(
+        learning_role=storage_strategy.learning_role,
+        unit_id="test_generator",
+        n_lines=47,
+        foresight=24,
+        srmc_multiplier=1.4,
+        srmc_upper_bound_floor=200,
+    )
+
+    storage_strategy.learning_role.initialize_policy()
+
+
+@pytest.mark.require_learning
+def test_storage_dispatch_policy_uses_actor_only_for_discharge(
+    mock_market_config, storage_unit
+):
+    product_start = pd.Timestamp("2023-07-01")
+    product_tuples = [(product_start, product_start + pd.Timedelta(hours=1), None)]
+    strategy = _dispatch_learning_strategy(storage_unit)
+
+    storage_unit.forecaster = UnitForecaster(
+        pd.date_range(product_start, periods=4, freq="h"),
+        market_prices={"test_market": [60.0, 50.0, 50.0, 50.0]},
+    )
+    storage_unit.outputs["cost_stored_energy"].at[product_start] = 80.0
+    with patch.object(
+        strategy,
+        "get_actions",
+        return_value=(th.tensor([-1.0]), th.tensor([0.0])),
+    ) as get_actions:
+        bids = strategy.calculate_bids(storage_unit, mock_market_config, product_tuples)
+
+    assert get_actions.call_count == 1
+    assert bids[0]["volume"] > 0
+    # The stored-energy cost is the dispatch floor, above the current forecast.
+    assert bids[0]["price"] == pytest.approx(80.0)
+    assert strategy._rl_active_by_start[product_start]
+    assert strategy.learning_role.all_actions[product_start][storage_unit.id]
+
+    charge_start = product_start + pd.Timedelta(hours=1)
+    charge_products = [(charge_start, charge_start + pd.Timedelta(hours=1), None)]
+    storage_unit.forecaster = UnitForecaster(
+        pd.date_range(charge_start, periods=4, freq="h"),
+        market_prices={"test_market": [40.0, 50.0, 50.0, 50.0]},
+    )
+    with patch.object(strategy, "get_actions") as get_actions:
+        bids = strategy.calculate_bids(storage_unit, mock_market_config, charge_products)
+
+    assert get_actions.call_count == 0
+    assert bids[0]["volume"] < 0
+    assert bids[0]["price"] == pytest.approx(65.0)
+    assert not strategy._rl_active_by_start[charge_start]
+    assert strategy.learning_role.all_actions[charge_start][storage_unit.id]
+
+
+@pytest.mark.require_learning
+def test_storage_dispatch_policy_masks_deterministic_charge_reward(
+    mock_market_config, storage_unit
+):
+    product_start = pd.Timestamp("2023-07-01")
+    product_tuples = [(product_start, product_start + pd.Timedelta(hours=1), None)]
+    storage_unit.forecaster = UnitForecaster(
+        pd.date_range(product_start, periods=4, freq="h"),
+        market_prices={"test_market": [40.0, 50.0, 50.0, 50.0]},
+    )
+    strategy = _dispatch_learning_strategy(storage_unit)
+    bids = strategy.calculate_bids(storage_unit, mock_market_config, product_tuples)
+    bids[0]["accepted_price"] = 65.0
+    bids[0]["accepted_volume"] = bids[0]["volume"]
+    storage_unit.set_dispatch_plan(mock_market_config, bids)
+
+    strategy.calculate_reward(storage_unit, mock_market_config, bids)
+
+    assert strategy.learning_role.all_active[product_start][storage_unit.id] == [0.0]
 
 
 @pytest.mark.require_learning

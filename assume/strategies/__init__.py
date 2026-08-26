@@ -108,6 +108,7 @@ try:
         StorageEnergyLearningStrategyCongestion,
         StorageEnergyLearningHeuristicStrategy,
         StorageEnergyLearningHeuristicStrategyCongestion,
+        StorageEnergyLearningHeuristicDispatchStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategy,
         RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
@@ -150,6 +151,9 @@ try:
     )
     bidding_strategies["storage_energy_learning_heuristic_congestion"] = (
         StorageEnergyLearningHeuristicStrategyCongestion
+    )
+    bidding_strategies["storage_energy_learning_heuristic_dispatch_congestion"] = (
+        StorageEnergyLearningHeuristicDispatchStrategyCongestion
     )
     bidding_strategies["renewable_energy_learning_single_bid_congestion"] = (
         RenewableEnergyLearningSingleBidStrategyCongestion

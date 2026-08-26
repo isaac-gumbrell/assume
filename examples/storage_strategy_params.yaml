@@ -14,3 +14,12 @@ bidding_strategy_params:
   # actions map from [-1, 1] to [-2000, 2000]; the submitted order price is the
   # absolute value, while the sign selects charging or discharging.
   storage_bid_price_limit: 2000.0
+
+  # For storage_energy_learning_heuristic_dispatch_congestion only. Charging is
+  # deterministic at forecast + charge_price_markup, capped at
+  # charge_bid_price_limit. The actor controls dispatch offers between the
+  # cost-aware floor and this bounded forecast markup.
+  forecast_multiplier: 1.4
+  forecast_upper_bound_floor: 200.0
+  charge_price_markup: 25.0
+  charge_bid_price_limit: 500.0

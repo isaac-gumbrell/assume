@@ -20,8 +20,10 @@ class ReplayBufferSamples(NamedTuple):
     observations: th.Tensor
     actions: th.Tensor
     next_observations: th.Tensor
+    next_actions: th.Tensor
     rewards: th.Tensor
     masks: th.Tensor
+    next_masks: th.Tensor
 
 
 class ReplayBuffer:
@@ -171,7 +173,8 @@ class ReplayBuffer:
             batch_size (int): The number of experiences to sample.
 
         Returns:
-            ReplayBufferSamples: A named tuple containing the sampled observations, actions, and rewards.
+            ReplayBufferSamples: A named tuple containing sampled transitions,
+                including the following action and activity mask.
 
         Raises:
             Exception: If there are less than two entries in the buffer.
@@ -186,8 +189,10 @@ class ReplayBuffer:
             self.observations[batch_inds, :, :],
             self.actions[batch_inds, :, :],
             self.observations[batch_inds + 1, :, :],
+            self.actions[batch_inds + 1, :, :],
             self.rewards[batch_inds],
             self.masks[batch_inds],
+            self.masks[batch_inds + 1],
         )
 
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
