@@ -220,13 +220,14 @@ def test_storage_dispatch_policy_masks_deterministic_charge_reward(
 
 
 @pytest.mark.require_learning
-def test_storage_dispatch_policy_records_complete_foreign_transition(
-    mock_market_config, storage_unit
+@pytest.mark.parametrize("is_foreign", [False, True])
+def test_storage_dispatch_policy_records_complete_no_bid_transition(
+    mock_market_config, storage_unit, is_foreign
 ):
     product_start = pd.Timestamp("2023-07-01")
     product_tuples = [(product_start, product_start + pd.Timedelta(hours=1), None)]
     strategy = _dispatch_learning_strategy(storage_unit)
-    storage_unit.forecaster.is_foreign = True
+    storage_unit.forecaster.is_foreign = is_foreign
 
     with patch.object(
         strategy.heuristic_strategy, "calculate_bids", return_value=[]
@@ -236,6 +237,7 @@ def test_storage_dispatch_policy_records_complete_foreign_transition(
     learning_role = strategy.learning_role
     unit_id = storage_unit.id
     assert bids == []
+    assert strategy._rl_active_by_start[product_start] is False
     assert len(learning_role.all_obs[product_start][unit_id]) == 1
     assert learning_role.all_obs[product_start][unit_id][0].shape == (strategy.obs_dim,)
     th.testing.assert_close(

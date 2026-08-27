@@ -2318,29 +2318,27 @@ class StorageEnergyLearningHeuristicDispatchStrategyCongestion(
             unit, market_config, product_tuples, **kwargs
         )
         if not bids:
-            if unit.forecaster.is_foreign:
-                # Foreign staggered-scenario storage is forced off, but still
-                # needs a masked transition to preserve the shared critic's
-                # agent ordering. It has no market callback, so record the
-                # complete inactive transition without submitting an order.
-                start, end = product_tuples[0][0], product_tuples[0][1]
-                self.create_observation(
-                    unit=unit,
-                    market_id=market_config.market_id,
-                    start=start,
-                    end=end,
+            # A storage heuristic can abstain for a native unit as well as for
+            # a foreign staggered unit. Neither outcome gets market feedback,
+            # so record a complete masked transition locally.
+            start, end = product_tuples[0][0], product_tuples[0][1]
+            self._rl_active_by_start[start] = False
+            self.create_observation(
+                unit=unit,
+                market_id=market_config.market_id,
+                start=start,
+                end=end,
+            )
+            actions = th.zeros(1, dtype=self.float_type, device=self.device)
+            noise = th.zeros_like(actions)
+            if self.learning_mode:
+                self.learning_role.add_actions_to_cache(
+                    self.unit_id, start, actions, noise
                 )
-                actions = th.zeros(1, dtype=self.float_type, device=self.device)
-                noise = th.zeros_like(actions)
-                if self.learning_mode:
-                    self.learning_role.add_actions_to_cache(
-                        self.unit_id, start, actions, noise
-                    )
-                    self.learning_role.add_reward_to_cache(
-                        self.unit_id, start, 0.0, 0.0, 0.0, active=0.0
-                    )
-                return []
-            return bids
+                self.learning_role.add_reward_to_cache(
+                    self.unit_id, start, 0.0, 0.0, 0.0, active=0.0
+                )
+            return []
 
         start, end = product_tuples[0][0], product_tuples[0][1]
         bid = bids[0]
