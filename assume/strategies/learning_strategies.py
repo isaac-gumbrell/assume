@@ -324,13 +324,23 @@ class TorchLearningStrategy(LearningStrategy):
             # to get a good initial experience, in the area around the costs of the agent
             if self.collect_initial_experience_mode:
                 # define current action as solely noise
-                noise = th.normal(
-                    mean=0.0,
-                    std=self.exploration_noise_std,
-                    size=(self.act_dim,),
-                    dtype=self.float_type,
-                    device=self.device,
-                )
+                if (
+                    self.learning_config.initial_exploration_distribution
+                    == "uniform"
+                ):
+                    noise = 2 * th.rand(
+                        self.act_dim,
+                        dtype=self.float_type,
+                        device=self.device,
+                    ) - 1
+                else:
+                    noise = th.normal(
+                        mean=0.0,
+                        std=self.exploration_noise_std,
+                        size=(self.act_dim,),
+                        dtype=self.float_type,
+                        device=self.device,
+                    )
 
                 # =============================================================================
                 # 2.1 Get Actions and handle exploration
@@ -1022,6 +1032,11 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
 
         if self.learning_mode:
             self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
+            if max_power == 0:
+                active = 0.0 if unit.forecaster.is_foreign else 1.0
+                self.learning_role.add_reward_to_cache(
+                    unit.id, start, 0.0, 0.0, 0.0, active
+                )
 
         return bids
 
@@ -1909,6 +1924,11 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
 
         if self.learning_mode:
             self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
+            if max_power == 0:
+                active = 0.0 if unit.forecaster.is_foreign else 1.0
+                self.learning_role.add_reward_to_cache(
+                    unit.id, start, 0.0, 0.0, 0.0, active
+                )
 
         return bids
 
@@ -2298,6 +2318,28 @@ class StorageEnergyLearningHeuristicDispatchStrategyCongestion(
             unit, market_config, product_tuples, **kwargs
         )
         if not bids:
+            if unit.forecaster.is_foreign:
+                # Foreign staggered-scenario storage is forced off, but still
+                # needs a masked transition to preserve the shared critic's
+                # agent ordering. It has no market callback, so record the
+                # complete inactive transition without submitting an order.
+                start, end = product_tuples[0][0], product_tuples[0][1]
+                self.create_observation(
+                    unit=unit,
+                    market_id=market_config.market_id,
+                    start=start,
+                    end=end,
+                )
+                actions = th.zeros(1, dtype=self.float_type, device=self.device)
+                noise = th.zeros_like(actions)
+                if self.learning_mode:
+                    self.learning_role.add_actions_to_cache(
+                        self.unit_id, start, actions, noise
+                    )
+                    self.learning_role.add_reward_to_cache(
+                        self.unit_id, start, 0.0, 0.0, 0.0, active=0.0
+                    )
+                return []
             return bids
 
         start, end = product_tuples[0][0], product_tuples[0][1]

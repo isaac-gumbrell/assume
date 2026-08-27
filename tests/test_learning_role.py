@@ -479,6 +479,32 @@ async def test_atomic_swap_no_data_loss(learning_role):
 
 
 @pytest.mark.require_learning
+def test_write_rl_params_reports_incomplete_unit_transition():
+    config = LearningConfig(
+        algorithm="matd3",
+        learning_mode=True,
+        evaluation_mode=True,
+        training_episodes=3,
+        episodes_collecting_initial_experience=1,
+    )
+    learning_role = Learning(config, start=start, end=end)
+    cache = {
+        "obs": {start: {"complete": [[1.0]], "missing_reward": [[2.0]]}},
+        "actions": {start: {"complete": [[0.1]], "missing_reward": [[0.2]]}},
+        "rewards": {start: {"complete": [1.0], "missing_reward": []}},
+        "noises": {start: {"complete": [[0.0]], "missing_reward": [[0.0]]}},
+        "regret": {start: {"complete": [0.0], "missing_reward": []}},
+        "profit": {start: {"complete": [1.0], "missing_reward": []}},
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"unit 'missing_reward': missing rewards, regret, profit",
+    ):
+        learning_role.write_rl_params_to_output(cache)
+
+
+@pytest.mark.require_learning
 async def test_atomic_swap_carries_over_two_incomplete_timesteps(learning_role):
     """
     Ensure that when two latest timesteps are incomplete (no reward yet),
@@ -534,6 +560,39 @@ async def test_atomic_swap_carries_over_two_incomplete_timesteps(learning_role):
     assert ts4 in learning_role.all_obs, (
         "ts4 reward should be accepted after carry-over"
     )
+
+
+@pytest.mark.require_learning
+async def test_atomic_swap_carries_over_partially_rewarded_multi_agent_timestamp(
+    learning_role,
+):
+    learning_role, th = learning_role
+    learning_role.rl_strats["unit_2"] = learning_role.rl_strats["unit_1"]
+    complete_ts, partial_ts = 1000, 2000
+
+    for timestamp in (complete_ts, partial_ts):
+        for unit_id in ("unit_1", "unit_2"):
+            learning_role.add_observation_to_cache(
+                unit_id, timestamp, th.tensor([1.0, 2.0])
+            )
+            learning_role.add_actions_to_cache(
+                unit_id, timestamp, th.tensor([0.5]), th.tensor([0.01])
+            )
+
+    for unit_id in ("unit_1", "unit_2"):
+        learning_role.add_reward_to_cache(
+            unit_id, complete_ts, 1.0, regret=0.0, profit=1.0
+        )
+    learning_role.add_reward_to_cache(
+        "unit_1", partial_ts, 1.0, regret=0.0, profit=1.0
+    )
+
+    await learning_role.store_to_buffer_and_update()
+
+    assert complete_ts not in learning_role.all_obs
+    assert partial_ts in learning_role.all_obs
+    assert learning_role.all_rewards[partial_ts]["unit_1"] == [1.0]
+    assert learning_role.all_rewards[partial_ts]["unit_2"] == []
 
 
 @pytest.mark.require_learning
@@ -665,6 +724,7 @@ async def test_shared_buffer_uses_anchor_unit_order_in_staggered():
 
     # Don't trigger a policy update (episode 0 = initial experience collection).
     secondary.episodes_done = 0
+    secondary.db_addr = None
 
     ts = "2024-01-01 00:00:00"
     # Per-unit distinguishable data so a column swap is detectable.
@@ -684,10 +744,21 @@ async def test_shared_buffer_uses_anchor_unit_order_in_staggered():
             }
         },
         "rewards": {ts: {"A": [1.0], "B": [2.0], "C": [3.0]}},
+        "noises": {
+            ts: {
+                "A": [th.tensor([0.0])],
+                "B": [th.tensor([0.0])],
+                "C": [th.tensor([0.0])],
+            }
+        },
+        "regret": {ts: {"A": [0.0], "B": [0.0], "C": [0.0]}},
+        "profit": {ts: {"A": [1.0], "B": [2.0], "C": [0.0]}},
         # C is foreign here -> active 0; A and B native -> active 1.
         "active": {ts: {"A": [1.0], "B": [1.0], "C": [0.0]}},
     }
 
+    # A masked foreign unit must still have a complete output transition.
+    secondary.write_rl_params_to_output(cache)
     await secondary._store_to_buffer_and_update_sync(cache, th.device("cpu"))
 
     # The buffer columns must follow the ANCHOR order (A, B, C), regardless of
