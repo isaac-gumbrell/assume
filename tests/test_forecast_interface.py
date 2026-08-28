@@ -411,6 +411,26 @@ def test_forecast_interface__naive_price_source_ignores_csv(
     assert list(unit.forecaster.price["EOM"]) == list(expected_price)
 
 
+def test_forecast_interface__alternate_naive_price_keeps_primary_forecast(
+    index, market_setup, forecast_setup
+):
+    unit = next(iter(forecast_setup["units"]))
+    forecasts = forecast_setup["forecast_df"].copy()
+    forecasts[f"price_{unit.node}"] = pd.Series(999.0, index=index)
+    expected_price = pd.read_csv(path / "results/price.csv", **parse_date)["price"]
+    unit.forecaster.price_forecast_source = "nodal_csv"
+
+    unit.forecaster.initialize(
+        forecast_setup["units"], market_setup["market_configs"], forecasts, unit
+    )
+
+    assert list(unit.forecaster.price["EOM"]) == [999.0] * len(index)
+    assert list(unit.forecaster.get_price_forecast("EOM", "naive")) == list(
+        expected_price
+    )
+    assert list(unit.forecaster.price["EOM"]) == [999.0] * len(index)
+
+
 def test_forecast_interface__rejects_unknown_price_source(
     market_setup, forecast_setup
 ):

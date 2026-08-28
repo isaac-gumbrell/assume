@@ -233,6 +233,10 @@ class UnitForecaster:
         if residual_load is None:
             residual_load = {}
         self.price: dict[str, ForecastSeries] = self._dict_to_series(market_prices)
+        self._price_forecasts_by_source: dict[str, dict[str, FastSeries]] = {}
+        self._price_forecast_context: (
+            tuple[list[BaseUnit], list[MarketConfig], BaseUnit | None] | None
+        ) = None
         self.residual_load: dict[str, ForecastSeries] = self._dict_to_series(
             residual_load
         )
@@ -259,6 +263,46 @@ class UnitForecaster:
         for key, value in d.items():
             result[key] = self._to_series(value)
         return result
+
+    def get_price_forecast(self, market_id: str, source: str = "primary") -> FastSeries:
+        """Return the primary or a cached alternate price forecast.
+
+        ``naive`` deliberately bypasses CSV price columns so a strategy can use the
+        market-wide merit-order signal without changing the unit's primary forecast.
+        """
+        if source == "primary":
+            return self.price[market_id]
+        if source != "naive":
+            raise ValueError(
+                f"Unknown alternate price forecast source '{source}'. Expected one of "
+                "['primary', 'naive']."
+            )
+
+        if source not in self._price_forecasts_by_source:
+            if self._price_forecast_context is None:
+                raise RuntimeError(
+                    "Naive price forecasts are available only after forecaster "
+                    "initialization."
+                )
+            units, market_configs, initializing_unit = self._price_forecast_context
+            naive_algorithm = self._registries["init"].get("price_naive_forecast")
+            if naive_algorithm is None:
+                raise ValueError(
+                    "The 'price_naive_forecast' algorithm is not registered."
+                )
+            forecasts = calculate_base_forecasts(
+                self.index,
+                units,
+                market_configs,
+                naive_algorithm,
+                preprocess_information=self.preprocess_information["price"],
+                prefix="price",
+                unit_node=(initializing_unit.node if initializing_unit else None),
+                price_forecast_source="naive",
+            )
+            self._price_forecasts_by_source[source] = self._dict_to_series(forecasts)
+
+        return self._price_forecasts_by_source[source][market_id]
 
     def preprocess(
         self,
@@ -349,6 +393,8 @@ class UnitForecaster:
             initializing_unit (BaseUnit, optional): The unit currently being initialized.
         """
         self.preprocess(units, market_configs, forecast_df, initializing_unit)
+        self._price_forecasts_by_source = {}
+        self._price_forecast_context = (units, market_configs, initializing_unit)
 
         # 1. Get price forecast
         price_forecast_algorithm_name = self.forecast_algorithms.get(

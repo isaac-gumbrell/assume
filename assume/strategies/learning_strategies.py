@@ -1421,11 +1421,13 @@ class StorageEnergyLearningHeuristicStrategy(StorageEnergyLearningStrategy):
         self,
         *args,
         heuristic_foresight: str = "12h",
+        heuristic_schedule_price_source: str = "primary",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.heuristic_strategy = StorageEnergyHeuristicFlexableStrategy(
-            eom_foresight=heuristic_foresight
+            eom_foresight=heuristic_foresight,
+            heuristic_schedule_price_source=heuristic_schedule_price_source,
         )
 
     def adjust_heuristic_price(

@@ -28,10 +28,18 @@ class StorageEnergyHeuristicFlexableStrategy(MinMaxChargeStrategy):
         **kwargs: Additional keyword arguments.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, *args, heuristic_schedule_price_source: str = "primary", **kwargs
+    ):
         super().__init__(*args, **kwargs)
 
         self.foresight = parse_duration(kwargs.get("eom_foresight", "12h"))
+        if heuristic_schedule_price_source not in {"primary", "naive"}:
+            raise ValueError(
+                "heuristic_schedule_price_source must be 'primary' or 'naive', got "
+                f"'{heuristic_schedule_price_source}'."
+            )
+        self.heuristic_schedule_price_source = heuristic_schedule_price_source
 
     def calculate_bids(
         self,
@@ -119,7 +127,9 @@ class StorageEnergyHeuristicFlexableStrategy(MinMaxChargeStrategy):
                 current_power_charge,
                 min_power_charge,
             )
-            price_forecast = unit.forecaster.price[market_config.market_id]
+            price_forecast = unit.forecaster.get_price_forecast(
+                market_config.market_id, self.heuristic_schedule_price_source
+            )
 
             # calculate average price
             average_price = calculate_price_average(

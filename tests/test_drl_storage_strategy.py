@@ -139,6 +139,15 @@ def test_storage_dispatch_heuristic_congestion_dimensions_match_shared_policy(
 
 
 @pytest.mark.require_learning
+def test_storage_dispatch_heuristic_forwards_schedule_price_source(storage_unit):
+    strategy = _dispatch_learning_strategy(
+        storage_unit, heuristic_schedule_price_source="naive"
+    )
+
+    assert strategy.heuristic_strategy.heuristic_schedule_price_source == "naive"
+
+
+@pytest.mark.require_learning
 def test_storage_dispatch_policy_shares_matd3_dimensions_with_srmc_congestion(
     storage_unit,
 ):

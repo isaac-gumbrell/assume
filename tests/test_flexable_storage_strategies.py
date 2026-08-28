@@ -153,6 +153,13 @@ def test_flexable_eom_storage(mock_market_config, storage):
     assert bids[20]["volume"] == -60
 
 
+def test_flexable_eom_storage_rejects_unknown_schedule_price_source():
+    with pytest.raises(ValueError, match="heuristic_schedule_price_source"):
+        StorageEnergyHeuristicFlexableStrategy(
+            heuristic_schedule_price_source="nodal_csv"
+        )
+
+
 def test_flexable_pos_crm_storage(mock_market_config, storage):
     index = pd.date_range("2023-07-01", periods=48, freq="h")
     start = datetime(2023, 7, 1)
