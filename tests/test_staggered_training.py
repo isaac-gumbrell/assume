@@ -150,6 +150,40 @@ def test_build_staggered_supersets_no_extras_for_identical_scenarios(tmp_path):
     assert extras[str(b)]["powerplant_units"].empty
 
 
+def test_build_staggered_supersets_honors_unit_file_overrides(tmp_path):
+    """Supersets must use the case-selected unit CSVs, not the defaults."""
+    bau = tmp_path / "bau"
+    inv = tmp_path / "inv"
+    ignored_bau = pd.DataFrame(
+        {"max_power": [100]}, index=pd.Index(["ignored_bau"], name="name")
+    )
+    ignored_inv = pd.DataFrame(
+        {"max_power": [200]}, index=pd.Index(["ignored_inv"], name="name")
+    )
+    selected_bau = pd.DataFrame(
+        {"max_power": [300]}, index=pd.Index(["pp_bau"], name="name")
+    )
+    selected_inv = pd.DataFrame(
+        {"max_power": [400]}, index=pd.Index(["pp_inv"], name="name")
+    )
+    _write_unit_csvs(bau, powerplants=ignored_bau)
+    _write_unit_csvs(inv, powerplants=ignored_inv)
+    selected_bau.to_csv(bau / "selected_powerplants.csv")
+    selected_inv.to_csv(inv / "selected_powerplants.csv")
+
+    local_ids, extras = build_staggered_supersets(
+        [str(bau), str(inv)],
+        {
+            str(bau): {"powerplant_units": "selected_powerplants.csv"},
+            str(inv): {"powerplant_units": "selected_powerplants.csv"},
+        },
+    )
+
+    assert local_ids == [{"pp_bau"}, {"pp_inv"}]
+    assert set(extras[str(bau)]["powerplant_units"].index) == {"pp_inv"}
+    assert set(extras[str(inv)]["powerplant_units"].index) == {"pp_bau"}
+
+
 def test_build_staggered_supersets_handles_missing_unit_types(tmp_path):
     """A scenario without a given unit-type CSV (e.g. no storage) should not
     crash; foreign storages from the other scenario should still be emitted as
@@ -630,7 +664,7 @@ def test_load_staggered_scenario_rejects_duplicate_simulation_ids(
     )
     monkeypatch.setattr(
         "assume.scenario.loader_csv.build_staggered_supersets",
-        lambda paths: ([], {p: {} for p in paths}),
+        lambda paths, unit_file_overrides=None: ([], {p: {} for p in paths}),
     )
     monkeypatch.setattr(
         "assume.scenario.loader_csv.load_config_and_create_forecaster",

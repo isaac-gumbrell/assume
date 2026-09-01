@@ -1321,7 +1321,9 @@ def _read_unit_index(path: str, file_name: str) -> set[str]:
 
 def _read_unit_csv(path: str, file_name: str) -> pd.DataFrame | None:
     """Read a unit CSV (raw, no config redirect) and return the DataFrame or None."""
-    fp = Path(path) / f"{file_name}.csv"
+    fp = Path(path) / file_name
+    if fp.suffix != ".csv":
+        fp = fp.with_suffix(".csv")
     if not fp.exists():
         return None
     df = pd.read_csv(
@@ -1336,6 +1338,7 @@ def _read_unit_csv(path: str, file_name: str) -> pd.DataFrame | None:
 
 def build_staggered_supersets(
     scenario_paths: list[str],
+    unit_file_overrides: dict[str, dict[str, str]] | None = None,
 ) -> tuple[
     list[set[str]],
     dict[str, dict[str, pd.DataFrame]],
@@ -1372,13 +1375,19 @@ def build_staggered_supersets(
     """
     UNIT_TYPES = ("powerplant_units", "storage_units", "demand_units")
 
+    unit_file_overrides = unit_file_overrides or {}
+
+    def read_unit_file(scenario_path: str, unit_type: str) -> pd.DataFrame | None:
+        file_name = unit_file_overrides.get(scenario_path, {}).get(unit_type, unit_type)
+        return _read_unit_csv(scenario_path, file_name)
+
     # canonical row per unit id per type, taken from the scenario where it natively lives
     canonical: dict[str, dict[str, pd.Series]] = {ut: {} for ut in UNIT_TYPES}
     local_ids: list[set[str]] = []
     for sp in scenario_paths:
         ids_here: set[str] = set()
         for ut in UNIT_TYPES:
-            df = _read_unit_csv(sp, ut)
+            df = read_unit_file(sp, ut)
             if df is None:
                 continue
             for uid, row in df.iterrows():
@@ -1388,7 +1397,7 @@ def build_staggered_supersets(
 
     extra_units_per_scenario: dict[str, dict[str, pd.DataFrame]] = {}
     for i, sp in enumerate(scenario_paths):
-        local_dfs = {ut: _read_unit_csv(sp, ut) for ut in UNIT_TYPES}
+        local_dfs = {ut: read_unit_file(sp, ut) for ut in UNIT_TYPES}
         extras: dict[str, pd.DataFrame] = {}
         for ut in UNIT_TYPES:
             local_set = (
@@ -1591,8 +1600,28 @@ def load_staggered_scenario(
     # naive signals for the scenario that is missing the file.
     _check_staggered_input_file_parity(scenario_paths, names)
 
+    # Resolve each active case's unit-file redirects before building the
+    # supersets. Otherwise a case-level storage_units override would be loaded
+    # into each world after the superset was constructed, breaking G2 parity.
+    study_cases_by_path: dict[str, str] = {}
+    unit_file_overrides: dict[str, dict[str, str]] = {}
+    for sp in scenario_paths:
+        with open(Path(sp) / "config.yaml") as f:
+            sc_config = yaml.safe_load(f)
+        sc_study_case = (
+            study_case if study_case in sc_config else list(sc_config.keys())[0]
+        )
+        study_cases_by_path[sp] = sc_study_case
+        sc_case_config = sc_config[sc_study_case]
+        unit_file_overrides[sp] = {
+            unit_type: str(sc_case_config.get(unit_type, f"{unit_type}.csv"))
+            for unit_type in ("powerplant_units", "storage_units", "demand_units")
+        }
+
     # Build the unit supersets across both scenarios.
-    _local_ids, extras_by_path = build_staggered_supersets(scenario_paths)
+    _local_ids, extras_by_path = build_staggered_supersets(
+        scenario_paths, unit_file_overrides
+    )
 
     # Load each scenario into its world with the foreign rows merged in.
     # Both worlds must share the same asyncio event loop so the orchestrator
@@ -1606,12 +1635,7 @@ def load_staggered_scenario(
         sp_path = Path(sp)
         scenario_inputs_path = str(sp_path.parent)
         scenario_name = sp_path.name
-        # discover study_case for this scenario (fall back to primary study_case)
-        with open(sp_path / "config.yaml") as f:
-            sc_config = yaml.safe_load(f)
-        sc_study_case = (
-            study_case if study_case in sc_config else list(sc_config.keys())[0]
-        )
+        sc_study_case = study_cases_by_path[sp]
 
         world.scenario_data = load_config_and_create_forecaster(
             scenario_inputs_path,
