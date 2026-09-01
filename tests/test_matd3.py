@@ -7,14 +7,17 @@ import os
 from copy import copy, deepcopy
 from datetime import datetime
 
+import numpy as np
 import pytest
 
 from assume.common.base import LearningConfig
+from assume.reinforcement_learning.buffer import ReplayBuffer
 
 try:
     import torch as th
 
     from assume.common.base import LearningStrategy
+    from assume.reinforcement_learning.algorithms.matd3 import atomic_torch_save
     from assume.reinforcement_learning.learning_role import Learning
     from assume.reinforcement_learning.learning_utils import (
         get_hidden_sizes,
@@ -26,6 +29,31 @@ except ImportError:
 
 start = datetime(2023, 7, 1)
 end = datetime(2023, 7, 2)
+
+
+def test_replay_sample_includes_next_action_and_mask():
+    buffer = ReplayBuffer(
+        buffer_size=3,
+        obs_dim=1,
+        act_dim=1,
+        n_rl_units=1,
+        device="cpu",
+        float_type=th.float32,
+    )
+    buffer.add(
+        obs=np.array([[[0.0]], [[1.0]], [[2.0]]]),
+        actions=np.array([[[-1.0]], [[0.25]], [[0.75]]]),
+        reward=np.zeros((3, 1, 1)),
+        mask=np.array([[1.0], [0.0], [1.0]]),
+    )
+
+    np.random.seed(0)
+    sample = buffer.sample(batch_size=1)
+
+    assert sample.next_actions.shape == (1, 1, 1)
+    assert sample.next_masks.shape == (1, 1)
+    assert sample.next_actions.item() == pytest.approx(0.25)
+    assert sample.next_masks.item() == pytest.approx(0.0)
 
 
 @pytest.fixture
@@ -217,6 +245,25 @@ def test_td3_save_params(learning_role_n, tmp_path):
     with open(order_file) as f:
         mapping = json.load(f)
     assert mapping.get("u_id_order") == ["agent_0", "agent_1"]
+
+
+@pytest.mark.require_learning
+def test_atomic_torch_save_preserves_checkpoint_on_replace_failure(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "actor.pt"
+    th.save({"version": "old"}, destination)
+
+    def fail_replace(source, target):
+        raise PermissionError("simulated sharing violation")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(PermissionError, match="sharing violation"):
+        atomic_torch_save({"version": "new"}, str(destination))
+
+    assert th.load(destination, weights_only=True) == {"version": "old"}
+    assert list(tmp_path.glob("actor.pt.*.tmp")) == []
 
 
 @pytest.mark.require_learning

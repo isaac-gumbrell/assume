@@ -387,6 +387,39 @@ def test_srmc_bid_never_below_marginal_cost(mock_market_config, power_plant):
 
 
 @pytest.mark.require_learning
+def test_srmc_zero_capacity_completes_learning_transition(
+    mock_market_config, power_plant
+):
+    """A zero-volume bid receives no feedback, so bidding must cache its zero reward."""
+    import torch as th
+
+    product_index = pd.date_range("2023-07-01", periods=1, freq="h")
+    start = product_index[0]
+    product_tuples = [(start, start + pd.Timedelta(hours=1), None)]
+    learning_role, config = _make_srmc_learning_role()
+    strategy = SRMCEnergyLearningStrategy(learning_role=learning_role, **config)
+
+    with (
+        patch.object(
+            SRMCEnergyLearningStrategy,
+            "get_actions",
+            return_value=(th.tensor([0.0]), th.tensor([0.0])),
+        ),
+        patch.object(PowerPlant, "calculate_min_max_power", return_value=([0.0], [0.0])),
+        patch.object(PowerPlant, "calculate_marginal_cost", return_value=0.0),
+    ):
+        bids = strategy.calculate_bids(
+            power_plant,
+            mock_market_config,
+            product_tuples=product_tuples,
+        )
+
+    assert bids[0]["volume"] == 0.0
+    assert learning_role.all_rewards[start][power_plant.id] == [0.0]
+    assert learning_role.all_active[start][power_plant.id] == [1.0]
+
+
+@pytest.mark.require_learning
 def test_srmc_get_actions_has_no_marginal_cost_bias():
     """SRMC exploration must not add the marginal-cost bias used by the parent.
 
@@ -410,6 +443,24 @@ def test_srmc_get_actions_has_no_marginal_cost_bias():
 
     # No marginal-cost bias: the action equals the pure exploration noise.
     assert th.allclose(action, noise, atol=1e-6)
+
+
+@pytest.mark.require_learning
+def test_srmc_uniform_initial_exploration_covers_action_range():
+    """Uniform initial exploration maps samples onto the full actor range."""
+    import torch as th
+
+    learning_role, config = _make_srmc_learning_role()
+    learning_role.learning_config.initial_exploration_distribution = "uniform"
+    strategy = SRMCEnergyLearningStrategy(learning_role=learning_role, **config)
+    strategy.collect_initial_experience_mode = True
+    observation = th.zeros(strategy.obs_dim, dtype=strategy.float_type)
+
+    with patch("assume.strategies.learning_strategies.th.rand", return_value=th.tensor([0.75])):
+        action, noise = strategy.get_actions(observation)
+
+    assert action.item() == pytest.approx(0.5)
+    assert th.equal(action, noise)
 
 
 @pytest.mark.require_learning
@@ -755,13 +806,19 @@ def test_activity_mask_keys_off_foreign_flag_not_availability(
         strategy.calculate_reward(
             power_plant, mc, orderbook=_orderbook(active_start, 100.0)
         )
-        # Night hour (availability=0): nothing offered, nothing dispatched.
-        strategy.calculate_reward(power_plant, mc, orderbook=_orderbook(off_start, 0.0))
+        # Night hour (availability=0): the zero-volume bid is removed before market
+        # feedback, so calculate_bids must complete the learning transition itself.
+        strategy.calculate_bids(
+            power_plant,
+            mc,
+            [(off_start, off_start + pd.Timedelta(hours=1), None)],
+        )
 
     # A native (non-foreign) unit is trainable in both hours - its own
     # zero-availability hour is a genuine, learnable state.
     assert lr.all_active[active_start][unit_id][0] == 1.0
     assert lr.all_active[off_start][unit_id][0] == 1.0
+    assert lr.all_rewards[off_start][unit_id][0] == 0.0
 
     # A foreign unit (forced off for the whole horizon) is masked out, regardless
     # of which hour we evaluate. (The cache appends, so check the latest entry.)

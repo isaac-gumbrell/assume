@@ -855,6 +855,7 @@ class LearningConfig:
     device: str = "cpu"
     episodes_collecting_initial_experience: int = 5
     exploration_noise_std: float = 0.2
+    initial_exploration_distribution: str = "normal"
     training_episodes: int = 100
     validation_episodes_interval: int = 5
     train_freq: str = "24h"
@@ -869,6 +870,10 @@ class LearningConfig:
     replay_buffer_size: int = 50000
     gamma: float = 0.99
     actor_architecture: str = "mlp"
+    # Pin the centralised critic width; otherwise it is chosen from n_agents alone,
+    # so a small diagnostic scenario silently uses a different architecture.
+    critic_hidden_sizes: list[int] | None = None
+    diagnostic_checkpoint_updates: list[int] | None = None
     policy_delay: int = 2
     noise_sigma: float = 0.1
     noise_scale: int = 1
@@ -921,6 +926,32 @@ class LearningConfig:
         if self.gradient_steps <= 0:
             raise ValueError(
                 f"gradient_steps need to be positive, got {self.gradient_steps}"
+            )
+
+        if self.initial_exploration_distribution not in {"normal", "uniform"}:
+            raise ValueError(
+                "initial_exploration_distribution must be 'normal' or 'uniform', "
+                f"got {self.initial_exploration_distribution!r}"
+            )
+
+        if self.diagnostic_checkpoint_updates:
+            invalid_updates = [
+                update
+                for update in self.diagnostic_checkpoint_updates
+                if not isinstance(update, int) or update < 0
+            ]
+            if invalid_updates:
+                raise ValueError(
+                    "diagnostic_checkpoint_updates must contain non-negative "
+                    f"integers, got {invalid_updates}"
+                )
+            if not self.trained_policies_save_path:
+                raise ValueError(
+                    "trained_policies_save_path is required when "
+                    "diagnostic_checkpoint_updates are configured"
+                )
+            self.diagnostic_checkpoint_updates = sorted(
+                set(self.diagnostic_checkpoint_updates)
             )
 
 

@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import uuid
 
 import torch as th
 from torch.optim import AdamW
@@ -17,6 +18,17 @@ from assume.reinforcement_learning.learning_utils import (
 from assume.reinforcement_learning.neural_network_architecture import CriticTD3
 
 logger = logging.getLogger(__name__)
+
+
+def atomic_torch_save(obj: object, path: str) -> None:
+    """Serialize beside the destination, then atomically replace it."""
+    tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        th.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 class TD3(RLAlgorithm):
@@ -91,7 +103,7 @@ class TD3(RLAlgorithm):
                 "critic_optimizer": strategy.critics.optimizer.state_dict(),
             }
             path = f"{directory}/critic_{u_id}.pt"
-            th.save(obj, path)
+            atomic_torch_save(obj, path)
 
         # record the exact order of u_ids and save it with critics to ensure that the same order is used when loading the parameters
         u_id_list = [str(u) for u in self.learning_role.rl_strats.keys()]
@@ -119,7 +131,7 @@ class TD3(RLAlgorithm):
                 "actor_optimizer": strategy.actor.optimizer.state_dict(),
             }
             path = f"{directory}/actor_{u_id}.pt"
-            th.save(obj, path)
+            atomic_torch_save(obj, path)
 
     def load_params(self, directory: str) -> None:
         """
@@ -397,6 +409,7 @@ class TD3(RLAlgorithm):
             If you have units with different observation dimensions. They need to have different critics and hence learning roles.
         """
         n_agents = len(self.learning_role.rl_strats)
+        hidden_sizes = getattr(self.learning_config, "critic_hidden_sizes", None)
 
         for strategy in self.learning_role.rl_strats.values():
             strategy.critics = CriticTD3(
@@ -405,6 +418,7 @@ class TD3(RLAlgorithm):
                 act_dim=self.act_dim,
                 unique_obs_dim=self.unique_obs_dim,
                 float_type=self.float_type,
+                hidden_sizes=hidden_sizes,
             ).to(self.device)
 
             strategy.target_critics = CriticTD3(
@@ -413,6 +427,7 @@ class TD3(RLAlgorithm):
                 act_dim=self.act_dim,
                 unique_obs_dim=self.unique_obs_dim,
                 float_type=self.float_type,
+                hidden_sizes=hidden_sizes,
             ).to(self.device)
 
             strategy.target_critics.load_state_dict(strategy.critics.state_dict())
@@ -523,6 +538,23 @@ class TD3(RLAlgorithm):
             )
             strategy.action_noise.update_noise_decay(updated_noise_decay)
 
+        diagnostic_updates = set(
+            self.learning_config.diagnostic_checkpoint_updates or []
+        )
+        if diagnostic_updates and self.n_updates == 0:
+            diagnostic_root = os.path.join(
+                self.learning_config.trained_policies_save_path,
+                "diagnostic_checkpoints",
+            )
+            os.makedirs(diagnostic_root, exist_ok=True)
+            self.learning_role.buffer.save(
+                os.path.join(diagnostic_root, "probe_buffer.npz")
+            )
+            if 0 in diagnostic_updates:
+                self.save_params(
+                    directory=os.path.join(diagnostic_root, "update_000000")
+                )
+
         for step in range(self.learning_config.gradient_steps):
             self.n_updates += 1
 
@@ -564,7 +596,12 @@ class TD3(RLAlgorithm):
                         for i, strategy in enumerate(strategies)
                     ]
                 )
-                next_actions = next_actions.transpose(0, 1).contiguous()
+                policy_next_actions = policy_next_actions.transpose(0, 1).contiguous()
+                next_actions = th.where(
+                    next_masks.unsqueeze(-1) > 0,
+                    policy_next_actions,
+                    transitions.next_actions,
+                )
                 next_actions = next_actions.view(-1, n_rl_agents * self.act_dim)
 
             all_actions = actions.view(self.learning_config.batch_size, -1)
@@ -795,6 +832,15 @@ class TD3(RLAlgorithm):
                 )
                 polyak_update(
                     all_actor_params, all_target_actor_params, self.learning_config.tau
+                )
+
+            if self.n_updates in diagnostic_updates:
+                self.save_params(
+                    directory=os.path.join(
+                        self.learning_config.trained_policies_save_path,
+                        "diagnostic_checkpoints",
+                        f"update_{self.n_updates:06d}",
+                    )
                 )
 
         self.learning_role.write_rl_grad_params_to_output(learning_rate, unit_params)

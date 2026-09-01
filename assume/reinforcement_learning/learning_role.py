@@ -259,10 +259,24 @@ class Learning(Role):
         # Get timestamps from cache we took
         all_timestamps = sorted(current_obs.keys())
         if len(all_timestamps) > 1:
-            # Identify all incomplete timesteps (no reward yet)
-            incomplete_timestamps = [
-                ts for ts in all_timestamps if ts not in current_rewards
-            ]
+            transition_fields = (
+                current_obs,
+                current_actions,
+                current_rewards,
+                current_noises,
+                current_regrets,
+                current_profits,
+                current_active,
+            )
+            incomplete_timestamps = []
+            for ts in all_timestamps:
+                unit_ids = current_obs[ts].keys()
+                if any(
+                    not field.get(ts, {}).get(unit_id)
+                    for unit_id in unit_ids
+                    for field in transition_fields
+                ):
+                    incomplete_timestamps.append(ts)
 
             # Process only complete timesteps
             timestamps_to_process = [
@@ -272,7 +286,11 @@ class Learning(Role):
             for ts in incomplete_timestamps:
                 self.all_obs[ts] = current_obs[ts]
                 self.all_actions[ts] = current_actions[ts]
+                self.all_rewards[ts] = current_rewards[ts]
                 self.all_noises[ts] = current_noises[ts]
+                self.all_regrets[ts] = current_regrets[ts]
+                self.all_profits[ts] = current_profits[ts]
+                self.all_active[ts] = current_active[ts]
 
             # Create filtered cache (only complete timesteps)
             cache = {
@@ -843,6 +861,26 @@ class Learning(Role):
         for unit_id in sorted(cache["obs"][next(iter(cache["obs"]))].keys()):
             starts = cache["obs"].keys()
             for idx, start in enumerate(starts):
+                required_fields = (
+                    "obs",
+                    "actions",
+                    "rewards",
+                    "noises",
+                    "regret",
+                    "profit",
+                )
+                missing_fields = [
+                    field
+                    for field in required_fields
+                    if not cache[field].get(start, {}).get(unit_id)
+                ]
+                if missing_fields:
+                    raise ValueError(
+                        "Incomplete RL transition at "
+                        f"{start!s} for unit {unit_id!r}: "
+                        f"missing {', '.join(missing_fields)}"
+                    )
+
                 output_dict = {
                     "datetime": start,
                     "unit": unit_id,
