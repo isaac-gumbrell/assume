@@ -157,3 +157,20 @@ rl_debug
 *issues/
 pathology_report.html
 docs/
+
+# Local modelling inputs and newly added root-level files
+/inputs/
+/ASSUME Modelling Manual.docx
+/RL_DIAGNOSTICS.md
+/rl_pathology_diagnostics.rst
+
+# Batch and log outputs
+**/logs/
+**/*batch*/
+**/*batch*
+
+tools/
+scripts/
+rl_pathology_testing/
+AGENTS.md
+keepalive.bat
