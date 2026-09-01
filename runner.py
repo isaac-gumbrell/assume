@@ -587,6 +587,7 @@ def run_single_case(
     interop_threads: int = _DEFAULT_INTEROP_THREADS,
     force_no_learning: bool = False,
     policy_base_scenario: str | None = None,
+    simulation_suffix: str = "",
 ) -> dict:
     """Run a single ASSUME study case in an isolated process."""
     if start_delay > 0:
@@ -644,6 +645,8 @@ def run_single_case(
                 "policy_base_scenario=%s — policy load path re-rooted to that folder",
                 policy_base_scenario,
             )
+        if simulation_suffix:
+            logger.info("simulation_suffix=%s", simulation_suffix)
         if (
             is_staggered_case(inputs_path, scenario, study_case)
             and not force_no_learning
@@ -664,6 +667,10 @@ def run_single_case(
                 world.scenario_data = load_config_and_create_forecaster(
                     inputs_path, scenario, study_case
                 )
+                if simulation_suffix:
+                    world.scenario_data["simulation_id"] = (
+                        f"{world.scenario_data['simulation_id']}{simulation_suffix}"
+                    )
                 if policy_base_scenario:
                     _patch_policy_base_scenario(
                         world.scenario_data, inputs_path, policy_base_scenario
@@ -682,6 +689,10 @@ def run_single_case(
                     scenario=scenario,
                     study_case=study_case,
                 )
+                if simulation_suffix:
+                    world.scenario_data["simulation_id"] = (
+                        f"{world.scenario_data['simulation_id']}{simulation_suffix}"
+                    )
                 if world.learning_mode:
                     logger.info("Learning mode engaged — training agents")
                     run_learning(world)
@@ -1080,6 +1091,7 @@ def run_batch_mode(cfg: dict) -> None:
     interop_threads: int = cfg.get("interop_threads", _DEFAULT_INTEROP_THREADS)
     force_no_learning: bool = cfg.get("force_no_learning", False)
     policy_base_scenario: str | None = cfg.get("policy_base_scenario") or None
+    simulation_suffix: str = cfg.get("simulation_suffix", "")
 
     run_id = _make_run_id()
 
@@ -1140,6 +1152,8 @@ def run_batch_mode(cfg: dict) -> None:
     )
     if policy_base_scenario:
         print(f"  Policies:  {policy_base_scenario} (policy_base_scenario override)")
+    if simulation_suffix:
+        print(f"  Simulation suffix: {simulation_suffix}")
     print(f"  Tasks:     {len(tasks_to_run)} total")
     for s in scenarios_to_run:
         print(
@@ -1152,7 +1166,8 @@ def run_batch_mode(cfg: dict) -> None:
             try:
                 task_type = (
                     "staggered"
-                    if is_staggered_case(
+                    if not force_no_learning
+                    and is_staggered_case(
                         inputs_path, task["scenario"], task["study_case"]
                     )
                     else "regular"
@@ -1174,7 +1189,9 @@ def run_batch_mode(cfg: dict) -> None:
                 get_staggered_sim_ids(inputs_path, task["scenario"], task["study_case"])
             )
         else:
-            sim_ids.append(f"{task['scenario']}_{task['study_case']}")
+            sim_ids.append(
+                f"{task['scenario']}_{task['study_case']}{simulation_suffix}"
+            )
     maintenance.delete_simulations(sim_ids)
     print(f"  Cleaned {len(sim_ids)} simulation(s) from database")
 
@@ -1217,6 +1234,7 @@ def run_batch_mode(cfg: dict) -> None:
                 interop_threads,
                 force_no_learning,
                 policy_base_scenario,
+                simulation_suffix,
             )
             future_to_task[future] = task
 
