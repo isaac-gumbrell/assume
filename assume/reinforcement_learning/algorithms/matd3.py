@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import time
 import uuid
 
 import torch as th
@@ -25,7 +26,15 @@ def atomic_torch_save(obj: object, path: str) -> None:
     tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
         th.save(obj, tmp_path)
-        os.replace(tmp_path, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError as error:
+                # SMB and virus scanners can briefly hold a checkpoint open.
+                if getattr(error, "winerror", None) not in (5, 32) or attempt == 4:
+                    raise
+                time.sleep(0.5)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
