@@ -926,6 +926,10 @@ class World:
                 if pbar is not None:
                     pbar.update(delta)
 
+        # tasks which fire at exactly end_ts need to be awaited before shutdown
+        await asyncio.sleep(0)
+        await tasks_complete_or_sleeping(container, except_sources=[])
+
     def run(self):
         """
         Run the simulation.

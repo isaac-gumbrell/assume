@@ -27,6 +27,7 @@ Upcoming Release
   - **Fix bug in forecasts**, that occurred when using complex clearing
   - **Fix infeasible power output in PowerPlant**: ``calculate_min_max_power`` now correctly accounts for base load, positive/negative capacity reserves, and heat demand when computing additional power. If reduced availability makes the unit infeasible to run, both min and max power are set to 0. A warning is issued if previous dispatch exceeded available power.
   - **Fix upward redispatch potential**, so that availabilities are now correctly considered instead of the nominal power output of the unit
+  - **Fix loss of the last ``train_freq`` window during learning**: Tasks scheduled at exactly the simulation end were started by the run loop but never awaited, because tasks registered with ``src="no_wait"`` are excluded from mango's termination detection. The run loop now drains all remaining tasks before shutting the container down. (#852)
   - **Fix non-deterministic results with equal-price bids**: The orderbook order no longer depends on ``PYTHONHASHSEED`` or on process timing in ``--parallel`` mode, so ties between equal-price bids are resolved reproducibly. (#861)
 
 0.6.1 - (25th March 2026)
