@@ -52,7 +52,7 @@ def calculate_srmc_action_bounds(
     """Return the lower and upper prices for an SRMC-bounded bid action."""
     lower_bound = min(max(srmc, 0.0), max_bid_price)
     upper_bound = min(
-        max(lower_bound * srmc_multiplier, srmc_upper_bound_floor),
+        max(lower_bound * srmc_multiplier, lower_bound + srmc_upper_bound_floor),
         max_bid_price,
     )
     return lower_bound, upper_bound
@@ -324,15 +324,16 @@ class TorchLearningStrategy(LearningStrategy):
             # to get a good initial experience, in the area around the costs of the agent
             if self.collect_initial_experience_mode:
                 # define current action as solely noise
-                if (
-                    self.learning_config.initial_exploration_distribution
-                    == "uniform"
-                ):
-                    noise = 2 * th.rand(
-                        self.act_dim,
-                        dtype=self.float_type,
-                        device=self.device,
-                    ) - 1
+                if self.learning_config.initial_exploration_distribution == "uniform":
+                    noise = (
+                        2
+                        * th.rand(
+                            self.act_dim,
+                            dtype=self.float_type,
+                            device=self.device,
+                        )
+                        - 1
+                    )
                 else:
                     noise = th.normal(
                         mean=0.0,
