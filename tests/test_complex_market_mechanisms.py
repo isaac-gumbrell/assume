@@ -593,6 +593,80 @@ def test_complex_clearing_congestion_pct():
     market_config.param_dict = {}
 
 
+def test_complex_clearing_with_isolated_node_without_orders():
+    """A bus without orders and without lines must not break the model."""
+    market_config = MarketConfig(
+        market_id="isolated_node_auction",
+        market_products=[MarketProduct(timedelta(hours=1), 2, timedelta(hours=1))],
+        additional_fields=["bid_type", "node_id"],
+        opening_hours=rr.rrule(
+            rr.HOURLY,
+            dtstart=datetime(2005, 6, 1),
+            until=datetime(2005, 6, 2),
+            cache=True,
+        ),
+        opening_duration=timedelta(hours=1),
+        volume_unit="MW",
+        price_unit="€/MW",
+        market_mechanism="complex_clearing",
+    )
+    nodes = pd.DataFrame(
+        {"name": ["node1", "node2", "node3"], "v_nom": [380.0] * 3}
+    ).set_index("name")
+    lines = pd.DataFrame(
+        {"name": ["line_1"], "bus0": ["node1"], "bus1": ["node2"], "s_nom": [500.0]}
+    ).set_index("name")
+    market_config.param_dict["grid_data"] = {"buses": nodes, "lines": lines}
+
+    next_opening = market_config.opening_hours.after(datetime(2005, 6, 1))
+    products = get_available_products(market_config.market_products, next_opening)
+
+    orderbook = []
+    orderbook = extend_orderbook(products, -300, 3000, orderbook, node="node1")
+    orderbook = extend_orderbook(products, 1000, 50, orderbook, node="node2")
+
+    mr = ComplexClearingRole(market_config)
+    accepted_orders, rejected_orders, meta, flows = mr.clear(orderbook, products)
+
+    assert rejected_orders == []
+    node1_meta = [m for m in meta if m["node"] == "node1"]
+    assert node1_meta
+    assert all(math.isclose(m["price"], 50, abs_tol=eps) for m in node1_meta)
+
+
+def test_order_surplus_of_linked_child_uses_child_volume():
+    """The surplus of a linked child must be based on the child's own volume."""
+    from types import SimpleNamespace
+
+    from assume.markets.clearing_algorithms.complex_clearing import (
+        calculate_order_surplus,
+    )
+
+    t0, t1 = datetime(2005, 6, 1, 0), datetime(2005, 6, 1, 1)
+    prices = {"node1": {t0: 40.0, t1: 40.0}}
+    parent = {
+        "bid_id": "parent",
+        "bid_type": "BB",
+        "node": "node1",
+        "price": 50.0,
+        "volume": {t0: 10.0, t1: 10.0},
+    }
+    child = {
+        "bid_id": "child",
+        "bid_type": "LB",
+        "node": "node1",
+        "price": 10.0,
+        "volume": {t0: 5.0, t1: 5.0},
+        "parent_bid_id": "parent",
+    }
+    instance = SimpleNamespace(xb={"parent": 1.0, "child": 1.0})
+
+    surplus = calculate_order_surplus(parent, prices, instance, [child])
+
+    # parent: 40 * 20 - 50 * 20 = -200; child: 40 * 10 - 10 * 10 = 300
+    assert math.isclose(surplus, 100.0, abs_tol=eps)
+
+
 if __name__ == "__main__":
     pass
     # from assume.common.utils import plot_orderbook

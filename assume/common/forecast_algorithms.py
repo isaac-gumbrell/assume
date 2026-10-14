@@ -639,10 +639,12 @@ def calculate_naive_line_congestion_signal(
 
     # Step 3: Per-line congestion signal
     result: dict[str, FastSeries] = {}
+    omitted_lines = []
     for line_id, line_data in lines.iterrows():
         node1, node2 = line_data["bus0"], line_data["bus1"]
 
         if node1 not in net_load_by_node or node2 not in net_load_by_node:
+            omitted_lines.append(line_id)
             continue
 
         line_net_load = net_load_by_node[node1] + net_load_by_node[node2]
@@ -677,6 +679,15 @@ def calculate_naive_line_congestion_signal(
             signal = net_load_vals / capacity
 
         result[line_id] = FastSeries(index=fast_idx, value=signal)
+
+    if omitted_lines:
+        log.warning(
+            "Per-line congestion signals omit %d of %d lines because an end bus "
+            "has no demand unit: %s",
+            len(omitted_lines),
+            len(lines),
+            omitted_lines,
+        )
 
     return result
 

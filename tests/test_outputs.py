@@ -306,3 +306,76 @@ def test_get_sum_reward_releases_connection(tmp_path):
 
     assert sorted(rewards.tolist()) == [3.0, 5.0]
     assert writer.db.pool.checkedin() == 0
+
+
+def _dispatch_rows(hour):
+    return [
+        {
+            "datetime": datetime(2020, 1, 1, hour),
+            "power": 10.0,
+            "market_id": "EOM",
+            "unit_id": "u1",
+        }
+    ]
+
+
+async def test_store_dfs_retries_failed_db_write_without_duplicates(tmp_path):
+    db_uri = f"sqlite:///{tmp_path / 'test.db'}"
+    writer = _make_writer(db_uri, export_csv_path=str(tmp_path / "csv"))
+    original_write = writer._write_df_to_db
+    calls = {"n": 0}
+
+    def flaky_write(table, df):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database unavailable")
+        original_write(table, df)
+
+    writer._write_df_to_db = flaky_write
+
+    writer.write_buffers["market_dispatch"].extend(_dispatch_rows(0))
+    await writer.store_dfs()
+    # the failed batch is kept, the csv has already been written
+    assert len(writer._pending_writes["market_dispatch"]) == 1
+    csv_path = writer.export_csv_path / "market_dispatch.csv"
+    assert len(pd.read_csv(csv_path)) == 1
+
+    writer.write_buffers["market_dispatch"].extend(_dispatch_rows(1))
+    await writer.store_dfs()
+
+    assert not writer._pending_writes["market_dispatch"]
+    # each row is written exactly once to each destination
+    assert len(pd.read_csv(csv_path)) == 2
+    db_rows = pd.read_sql("select * from market_dispatch", writer.db)
+    assert sorted(pd.to_datetime(db_rows["datetime"]).dt.hour.tolist()) == [0, 1]
+    writer.db.dispose()
+
+
+def test_store_kpis_uses_eval_episode_in_evaluation_mode(tmp_path):
+    db_uri = f"sqlite:///{tmp_path / 'test.db'}"
+    writer = _make_writer(
+        db_uri,
+        learning_mode=True,
+        evaluation_mode=True,
+        episode=5,
+        eval_episode=2,
+    )
+    pd.DataFrame(
+        {
+            "unit": ["u1", "u1", "u1"],
+            "reward": [1.0, 2.0, 100.0],
+            "regret": [0.0, 0.0, 0.0],
+            "profit": [1.0, 2.0, 100.0],
+            "evaluation_mode": [True, True, False],
+            "episode": [2, 2, 2],
+            "simulation": ["sim_a", "sim_a", "sim_a"],
+        }
+    ).to_sql("rl_params", writer.db, index=False)
+
+    writer.store_kpis()
+
+    kpis = pd.read_sql("select * from kpis", writer.db).set_index("variable")
+    # only evaluation rows of eval episode 2 are counted
+    assert kpis.loc["sum_reward", "value"] == 3.0
+    assert kpis.loc["sum_profit", "value"] == 3.0
+    writer.db.dispose()

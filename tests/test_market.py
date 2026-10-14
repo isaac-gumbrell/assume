@@ -311,3 +311,91 @@ async def test_market_accepted(market_role: MarketRole):
 
     accepted, meta = await market_role.clear_market([(start, end, None)])
     assert accepted == orderbook
+
+
+def _plain_market_role():
+    marketconfig = MarketConfig(
+        market_id="Test",
+        opening_hours=rr.rrule(rr.HOURLY, dtstart=start, until=end),
+        opening_duration=rd(hours=1),
+        market_mechanism="pay_as_clear",
+        market_products=[MarketProduct(rd(hours=1), 1, rd(hours=1))],
+        maximum_bid_price=1000,
+        minimum_bid_price=-500,
+        maximum_bid_volume=100,
+    )
+    return MarketRole(marketconfig=marketconfig)
+
+
+def test_validate_orderbook_drops_order_for_closed_product():
+    role = _plain_market_role()
+    open_end = start + rd(hours=1)
+    role.open_auctions = {(start, open_end, None)}
+    orderbook = [
+        {"start_time": start, "end_time": open_end, "volume": 10, "price": 5},
+        {
+            "start_time": open_end,
+            "end_time": open_end + rd(hours=1),
+            "volume": 10,
+            "price": 5,
+        },
+    ]
+
+    role.validate_orderbook(orderbook, "agent")
+
+    assert len(orderbook) == 1
+    assert orderbook[0]["start_time"] == start
+
+
+def test_validate_orderbook_clips_block_bid_values():
+    role = _plain_market_role()
+    bb_end = start + rd(hours=3)
+    hours = pd.date_range(start, bb_end - pd.Timedelta("1h"), freq="1h")
+    role.open_auctions = {(h, h + rd(hours=1), None) for h in hours}
+    orderbook = [
+        {
+            "start_time": start,
+            "end_time": bb_end,
+            "volume": {h: v for h, v in zip(hours, [50, 150, -200])},
+            "price": {h: p for h, p in zip(hours, [1500, 10, -900])},
+            "bid_type": "BB",
+            "bid_id": "bb1",
+        }
+    ]
+
+    role.validate_orderbook(orderbook, "agent")
+
+    assert len(orderbook) == 1
+    assert list(orderbook[0]["price"].values()) == [1000, 10, -500]
+    assert list(orderbook[0]["volume"].values()) == [50, 100, -100]
+
+
+def test_validate_orderbook_drops_block_bid_with_closed_hour_and_children():
+    role = _plain_market_role()
+    bb_end = start + rd(hours=2)
+    hours = pd.date_range(start, bb_end - pd.Timedelta("1h"), freq="1h")
+    # only the first hour of the block is open
+    role.open_auctions = {(start, start + rd(hours=1), None)}
+    orderbook = [
+        {
+            "start_time": start,
+            "end_time": bb_end,
+            "volume": dict.fromkeys(hours, 10),
+            "price": dict.fromkeys(hours, 10),
+            "bid_type": "BB",
+            "bid_id": "parent",
+        },
+        {
+            "start_time": start,
+            "end_time": start + rd(hours=1),
+            "volume": {start: 5},
+            "price": {start: 10},
+            "bid_type": "LB",
+            "bid_id": "child",
+            "parent_bid_id": "parent",
+        },
+    ]
+
+    role.validate_orderbook(orderbook, "agent")
+
+    assert orderbook == []

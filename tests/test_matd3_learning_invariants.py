@@ -200,3 +200,50 @@ def test_actor_gradient_does_not_vanish():
         f"actor gradient norm has collapsed to {grad_norm:.2e}; "
         "the policy is frozen regardless of what the critic learns"
     )
+
+
+@pytest.mark.require_learning
+def test_actor_update_does_not_touch_critic_gradients():
+    """The actor backward pass must not compute critic weight gradients, and
+    the critics must be trainable again afterwards."""
+    learn = _make_learning_role()
+    _fill_buffer(learn, reward=1.0)
+    strategies = list(learn.rl_strats.values())
+
+    critic_grads_after_critic_step = {}
+    actor_steps = []
+
+    def wrap_critic_step(strategy, step):
+        def wrapped(*args, **kwargs):
+            result = step(*args, **kwargs)
+            critic_grads_after_critic_step[strategy.unit_id] = [
+                p.grad.clone() for p in strategy.critics.parameters()
+            ]
+            return result
+
+        return wrapped
+
+    def wrap_actor_step(step):
+        def wrapped(*args, **kwargs):
+            for strategy in strategies:
+                for p, before in zip(
+                    strategy.critics.parameters(),
+                    critic_grads_after_critic_step[strategy.unit_id],
+                ):
+                    assert th.equal(p.grad, before)
+            actor_steps.append(1)
+            return step(*args, **kwargs)
+
+        return wrapped
+
+    for strategy in strategies:
+        strategy.critics.optimizer.step = wrap_critic_step(
+            strategy, strategy.critics.optimizer.step
+        )
+        strategy.actor.optimizer.step = wrap_actor_step(strategy.actor.optimizer.step)
+
+    _train(learn, updates=2)
+
+    assert actor_steps, "the actor update was never run"
+    for strategy in strategies:
+        assert all(p.requires_grad for p in strategy.critics.parameters())

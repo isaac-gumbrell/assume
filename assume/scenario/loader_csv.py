@@ -2045,6 +2045,7 @@ def run_learning(
             persist_replay_buffer()
 
         # evaluation run:
+        terminate = False
         if (
             episode % validation_interval == 0
             and episode
@@ -2085,10 +2086,6 @@ def run_learning(
 
             inter_episodic_data["eval_episodes_done"] = eval_episode
 
-            # if we have not improved in the last x evaluations, we stop loop
-            if terminate:
-                break
-
             eval_episode += 1
 
         world.reset()
@@ -2099,6 +2096,11 @@ def run_learning(
             >= world.learning_role.learning_config.episodes_collecting_initial_experience
             + validation_interval
         ):
+            # keep the saved runtime state in sync with the loop counters
+            world.learning_role.episodes_done = inter_episodic_data["episodes_done"]
+            world.learning_role.eval_episodes_done = inter_episodic_data[
+                "eval_episodes_done"
+            ]
             world.learning_role.rl_algorithm.save_params(
                 directory=f"{world.learning_role.learning_config.trained_policies_save_path}/last_policies"
             )
@@ -2116,6 +2118,11 @@ def run_learning(
                     logger.info(f"Learning runtime state saved: {state_save_path}")
             except Exception:
                 logger.warning("Failed to save learning runtime state")
+
+        # if we have not improved in the last x evaluations, we stop the loop
+        # after the checkpoint above has been saved
+        if terminate:
+            break
 
     # container shutdown implicitly with new initialisation
     logger.info("################")

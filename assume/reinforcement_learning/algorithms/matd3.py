@@ -13,12 +13,17 @@ from torch.optim import AdamW
 
 from assume.reinforcement_learning.algorithms.base_algorithm import RLAlgorithm
 from assume.reinforcement_learning.learning_utils import (
+    get_hidden_sizes,
     polyak_update,
     transfer_weights,
 )
 from assume.reinforcement_learning.neural_network_architecture import CriticTD3
 
 logger = logging.getLogger(__name__)
+
+
+class CriticArchitectureMismatchError(ValueError):
+    """Raised when saved critic weights do not match the current critic architecture."""
 
 
 def atomic_torch_save(obj: object, path: str) -> None:
@@ -204,6 +209,25 @@ class TD3(RLAlgorithm):
                         )
                         continue
 
+                if "critic" in critic_params:
+                    loaded_hidden = get_hidden_sizes(
+                        critic_params["critic"], prefix="q1_layers"
+                    )
+                    current_hidden = get_hidden_sizes(
+                        strategy.critics.state_dict(), prefix="q1_layers"
+                    )
+                    if loaded_hidden != current_hidden:
+                        raise CriticArchitectureMismatchError(
+                            f"Saved critic for {u_id} in '{directory}' has hidden layer "
+                            f"sizes {loaded_hidden}, but the current critic uses "
+                            f"{current_hidden}. This happens when critic_hidden_sizes "
+                            "(or the number of learning agents, which sets the default "
+                            "size) differs from the run that saved the checkpoint. Set "
+                            "critic_hidden_sizes back to the saved sizes, or use a fresh "
+                            "trained_policies_save_path and turn off continue_learning, "
+                            "load_learning_state and load_replay_buffer."
+                        )
+
                 if direct_load:
                     strategy.critics.load_state_dict(critic_params["critic"])
                     strategy.target_critics.load_state_dict(
@@ -243,6 +267,8 @@ class TD3(RLAlgorithm):
                     strategy.target_critics.load_state_dict(target_critic_weights)
                     logger.debug(f"Critic weights transferred for {u_id}.")
 
+            except CriticArchitectureMismatchError:
+                raise
             except Exception as e:
                 logger.warning(f"Failed to load critic for {u_id}: {e}")
 
@@ -742,58 +768,72 @@ class TD3(RLAlgorithm):
 
                 total_actor_loss = 0.0
 
-                # We'll compute each agent's actor loss, accumulate, then do one backprop
-                for i, strategy in enumerate(strategies):
-                    actor = strategy.actor
-                    critic = strategy.critics
+                # Freeze the critic parameters during the actor update. Gradients
+                # still flow through the critics to the actions, but no critic
+                # weight gradients are computed (they are not used here).
+                frozen_critic_params = [
+                    p for strategy in strategies for p in strategy.critics.parameters()
+                ]
+                critic_requires_grad = [p.requires_grad for p in frozen_critic_params]
+                for p in frozen_critic_params:
+                    p.requires_grad_(False)
 
-                    # Build local state for actor i
-                    state_i = states[:, i, :]
-                    action_i = actor(state_i)
+                try:
+                    # We'll compute each agent's actor loss, accumulate, then do one backprop
+                    for i, strategy in enumerate(strategies):
+                        actor = strategy.actor
+                        critic = strategy.critics
 
-                    # Construct final state representation for agent i
-                    other_unique_obs = th.cat(
-                        (
-                            unique_obs_from_others[:, :i],
-                            unique_obs_from_others[:, i + 1 :],
-                        ),
-                        dim=1,
-                    )
-                    all_states_i = th.cat(
-                        (
-                            state_i.reshape(self.learning_config.batch_size, -1),
-                            other_unique_obs.reshape(
-                                self.learning_config.batch_size, -1
+                        # Build local state for actor i
+                        state_i = states[:, i, :]
+                        action_i = actor(state_i)
+
+                        # Construct final state representation for agent i
+                        other_unique_obs = th.cat(
+                            (
+                                unique_obs_from_others[:, :i],
+                                unique_obs_from_others[:, i + 1 :],
                             ),
-                        ),
-                        dim=1,
-                    )
+                            dim=1,
+                        )
+                        all_states_i = th.cat(
+                            (
+                                state_i.reshape(self.learning_config.batch_size, -1),
+                                other_unique_obs.reshape(
+                                    self.learning_config.batch_size, -1
+                                ),
+                            ),
+                            dim=1,
+                        )
 
-                    # Replace the i-th agent's action in the batch
-                    all_actions_clone = actions.clone().detach()
-                    all_actions_clone[:, i, :] = action_i
+                        # Replace the i-th agent's action in the batch
+                        all_actions_clone = actions.clone().detach()
+                        all_actions_clone[:, i, :] = action_i
 
-                    # Flatten again for the critic
-                    all_actions_clone = all_actions_clone.view(
-                        self.learning_config.batch_size, -1
-                    )
+                        # Flatten again for the critic
+                        all_actions_clone = all_actions_clone.view(
+                            self.learning_config.batch_size, -1
+                        )
 
-                    # Calculate actor loss (negative Q1 of the updated action),
-                    # masking out forced-off transitions and normalising by the
-                    # number of active samples to keep the gradient scale stable.
-                    mask_i = masks[:, i].unsqueeze(1)
-                    q1 = critic.q1_forward(all_states_i, all_actions_clone)
-                    actor_loss = -(mask_i * q1).sum() / mask_i.sum().clamp(min=1.0)
+                        # Calculate actor loss (negative Q1 of the updated action),
+                        # masking out forced-off transitions and normalising by the
+                        # number of active samples to keep the gradient scale stable.
+                        mask_i = masks[:, i].unsqueeze(1)
+                        q1 = critic.q1_forward(all_states_i, all_actions_clone)
+                        actor_loss = -(mask_i * q1).sum() / mask_i.sum().clamp(min=1.0)
 
-                    # Store the actor loss for this unit ID
-                    unit_params[step][strategy.unit_id]["actor_loss"] = (
-                        actor_loss.item()
-                    )
-                    # Accumulate actor losses
-                    total_actor_loss += actor_loss
+                        # Store the actor loss for this unit ID
+                        unit_params[step][strategy.unit_id]["actor_loss"] = (
+                            actor_loss.item()
+                        )
+                        # Accumulate actor losses
+                        total_actor_loss += actor_loss
 
-                # Single backward pass for all actors
-                total_actor_loss.backward()
+                    # Single backward pass for all actors
+                    total_actor_loss.backward()
+                finally:
+                    for p, flag in zip(frozen_critic_params, critic_requires_grad):
+                        p.requires_grad_(flag)
 
                 # Clip and step each actor optimizer
                 for strategy in strategies:

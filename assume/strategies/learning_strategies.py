@@ -355,7 +355,8 @@ class TorchLearningStrategy(LearningStrategy):
             else:
                 # if we are not in the initial exploration phase we chose the action with the actor neural net
                 # and add noise to the action
-                curr_action = self.actor(next_observation).detach()
+                with th.no_grad():
+                    curr_action = self.actor(next_observation)
                 noise = self.action_noise.noise(
                     device=self.device, dtype=self.float_type
                 )
@@ -367,7 +368,8 @@ class TorchLearningStrategy(LearningStrategy):
                 )
         else:
             # if we are not in learning mode we just use the actor neural net to get the action without adding noise
-            curr_action = self.actor(next_observation).detach()
+            with th.no_grad():
+                curr_action = self.actor(next_observation)
             # noise is an tensor with zeros, because we are not in learning mode
             noise = th.zeros_like(curr_action, dtype=self.float_type)
 
@@ -2069,6 +2071,15 @@ class _CongestionObsMixin:
     def prepare_observations(self, unit, market_id):
         super().prepare_observations(unit, market_id)
         line_signals = unit.forecaster.congestion_signal_lines
+        # an empty dict falls back to zero windows in create_observation; a
+        # non-empty dict must cover every line, otherwise the observation
+        # would silently be shorter than obs_dim
+        if line_signals and len(line_signals) != self.n_lines:
+            raise ValueError(
+                f"Unit {unit.id}: expected congestion signals for n_lines={self.n_lines} "
+                f"lines, but the forecaster provides {len(line_signals)}: "
+                f"{sorted(line_signals.keys())}"
+            )
         # Fixed sorted order so channel N always maps to the same line
         self.congestion_line_obs: dict[str, FastSeries] = {
             line_id: line_signals[line_id] for line_id in sorted(line_signals.keys())
@@ -2109,6 +2120,15 @@ class _CongestionObsMixin:
                     for line_id in sorted(self.congestion_line_obs.keys())
                 ]
             )
+            expected_size = self.n_lines * self.congestion_foresight
+            if congestion_windows.size != expected_size:
+                raise ValueError(
+                    f"Unit {unit.id}: congestion windows at {start} have "
+                    f"{congestion_windows.size} values, expected {expected_size} "
+                    f"(n_lines={self.n_lines} x congestion_foresight="
+                    f"{self.congestion_foresight}) for lines "
+                    f"{sorted(self.congestion_line_obs.keys())}"
+                )
         else:
             congestion_windows = np.zeros(self.n_lines * self.congestion_foresight)
 

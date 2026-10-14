@@ -76,7 +76,7 @@ def test_replay_buffer_add():
     buffer.add(obs, actions, reward)
 
     sample = buffer.sample(1)
-    (observations, actions, next_observations, rewards, masks) = sample
+    observations, actions, next_observations, _, rewards, masks, _ = sample
 
     assert rewards.shape == (1, 4)
     assert masks.shape == (1, 4)
@@ -86,10 +86,70 @@ def test_replay_buffer_add():
 
     # now sample twice
     sample = buffer.sample(2)
-    (observations, actions, next_observations, rewards, masks) = sample
+    observations, actions, next_observations, _, rewards, masks, _ = sample
 
     assert rewards.shape == (2, 4)
     assert masks.shape == (2, 4)
     assert actions.shape == (2, 4, 3)
     assert next_observations.shape == (2, 4, 2)
     assert observations.shape == (2, 4, 2)
+
+
+def _make_buffer(buffer_size):
+    return ReplayBuffer(
+        buffer_size=buffer_size,
+        obs_dim=1,
+        act_dim=1,
+        n_rl_units=1,
+        device=th.device("cpu"),
+        float_type=th.float,
+    )
+
+
+def _add_steps(buffer, values):
+    values = np.asarray(values, dtype=float)
+    obs = values.reshape(-1, 1, 1)
+    buffer.add(obs, obs.copy(), values.reshape(-1, 1, 1))
+
+
+@pytest.mark.require_learning
+def test_replay_buffer_add_wraps_around():
+    buffer = _make_buffer(5)
+    _add_steps(buffer, [0, 1, 2])
+    # crosses the end of the buffer: 3, 4 at the end, 5, 6 at the start
+    _add_steps(buffer, [3, 4, 5, 6])
+
+    assert buffer.full
+    assert buffer.pos == 2
+    assert buffer.observations[:, 0, 0].tolist() == [5, 6, 2, 3, 4]
+    assert buffer.rewards[:, 0].tolist() == [5, 6, 2, 3, 4]
+
+
+@pytest.mark.require_learning
+def test_replay_buffer_add_larger_than_buffer_keeps_newest():
+    buffer = _make_buffer(4)
+    _add_steps(buffer, [0])
+    _add_steps(buffer, list(range(1, 11)))
+
+    assert buffer.full
+    # same layout as adding the rows one by one
+    reference = _make_buffer(4)
+    for value in range(11):
+        _add_steps(reference, [value])
+    assert buffer.pos == reference.pos
+    np.testing.assert_array_equal(buffer.observations, reference.observations)
+
+
+@pytest.mark.require_learning
+def test_replay_buffer_sample_next_is_successor_after_wrap():
+    buffer = _make_buffer(5)
+    _add_steps(buffer, list(range(8)))  # newest value 7 is at index 2
+
+    for _ in range(20):
+        sample = buffer.sample(16)
+        obs = sample.observations[:, 0, 0]
+        next_obs = sample.next_observations[:, 0, 0]
+        # every transition pairs a row with the row added right after it
+        assert th.equal(next_obs, obs + 1)
+        # the newest row has no successor and is never sampled
+        assert not (obs == 7).any()

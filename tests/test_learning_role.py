@@ -583,9 +583,7 @@ async def test_atomic_swap_carries_over_partially_rewarded_multi_agent_timestamp
         learning_role.add_reward_to_cache(
             unit_id, complete_ts, 1.0, regret=0.0, profit=1.0
         )
-    learning_role.add_reward_to_cache(
-        "unit_1", partial_ts, 1.0, regret=0.0, profit=1.0
-    )
+    learning_role.add_reward_to_cache("unit_1", partial_ts, 1.0, regret=0.0, profit=1.0)
 
     await learning_role.store_to_buffer_and_update()
 
@@ -838,3 +836,75 @@ async def test_store_to_buffer_rejects_unit_id_set_mismatch():
     # Nothing should have been written to the buffer.
     assert buffer.pos == 0
     assert buffer.full is False
+
+
+def _add_complete_step(role, th, ts, unit_id="unit_1"):
+    role.add_observation_to_cache(unit_id, ts, th.tensor([1.0, 2.0]))
+    role.add_actions_to_cache(unit_id, ts, th.tensor([0.5]), th.tensor([0.01]))
+    role.add_reward_to_cache(unit_id, ts, 1.0, regret=0.0, profit=1.0)
+
+
+@pytest.mark.require_learning
+async def test_store_to_buffer_processes_single_complete_timestamp(learning_role):
+    """A flush containing a single complete timestep is stored, not discarded."""
+    role, th = learning_role
+    _add_complete_step(role, th, 1000)
+
+    await role.store_to_buffer_and_update()
+
+    role.write_rl_params_to_output.assert_called_once()
+    cache = role.write_rl_params_to_output.call_args.args[0]
+    assert list(cache["obs"].keys()) == [1000]
+    assert not role.all_obs
+
+
+@pytest.mark.require_learning
+async def test_store_to_buffer_carries_incomplete_timestamp_only_once(learning_role):
+    """An incomplete timestep is carried to the next flush once, then dropped."""
+    role, th = learning_role
+    _add_complete_step(role, th, 1000)
+    # ts 2000 never receives a reward
+    role.add_observation_to_cache("unit_1", 2000, th.tensor([3.0, 4.0]))
+    role.add_actions_to_cache("unit_1", 2000, th.tensor([0.6]), th.tensor([0.02]))
+
+    await role.store_to_buffer_and_update()
+    assert 2000 in role.all_obs
+
+    _add_complete_step(role, th, 3000)
+    await role.store_to_buffer_and_update()
+
+    cache = role.write_rl_params_to_output.call_args.args[0]
+    assert list(cache["obs"].keys()) == [3000]
+    assert 2000 not in role.all_obs
+
+
+@pytest.mark.require_learning
+async def test_deferred_policy_update_sets_pending_flag():
+    """In staggered training the flush marks an update as pending instead of
+    running update_policy itself."""
+    import torch as th
+
+    config = _progress_config()
+    learn = Learning(config["learning_config"], start=start, end=end)
+    learn.rl_strats["unit_1"] = LearningStrategy(**config, learning_role=learn)
+    learn.initialize_policy()
+    learn._context = MagicMock()
+    learn._context.current_timestamp = 0.0
+    learn.episodes_done = 5
+    learn.defer_policy_update = True
+    learn.rl_algorithm.update_policy = MagicMock()
+    learn.buffer = MagicMock()
+
+    ts = 1000
+    cache = {
+        "obs": {ts: {"unit_1": [th.tensor([1.0, 2.0])]}},
+        "actions": {ts: {"unit_1": [th.tensor([0.5, 0.5])]}},
+        "rewards": {ts: {"unit_1": [1.0]}},
+        "active": {ts: {"unit_1": [1.0]}},
+    }
+
+    await learn._store_to_buffer_and_update_sync(cache, th.device("cpu"))
+
+    learn.buffer.add.assert_called_once()
+    learn.rl_algorithm.update_policy.assert_not_called()
+    assert learn._policy_update_pending is True

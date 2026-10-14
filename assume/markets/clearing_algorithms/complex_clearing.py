@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import logging
+from collections import defaultdict
 from datetime import timedelta
 from operator import itemgetter
 
@@ -141,12 +142,36 @@ def market_clearing_opt_constraints(
                     model.xb[order["bid_id"]] <= model.xb[parent_bid_id]
                 )
 
+    # Precompute the balance terms once instead of scanning all orders and all
+    # lines for every (node, t). Terms keep the original orderbook order.
+    balance_terms = defaultdict(list)
+    for order in orders:
+        if order["bid_type"] == "SB":
+            balance_terms[(order["node"], order["start_time"])].append(
+                (order["volume"], model.xs[order["bid_id"]])
+            )
+        elif order["bid_type"] in ["BB", "LB"]:
+            for start_time, volume in order["volume"].items():
+                balance_terms[(order["node"], start_time)].append(
+                    (volume, model.xb[order["bid_id"]])
+                )
+
+    node_line_terms = {}
+    if incidence_matrix is not None:
+        incidence_values = incidence_matrix.to_numpy()
+        for i, node in enumerate(nodes):
+            node_line_terms[node] = [
+                (line_ids[j], incidence_values[i, j])
+                for j in range(len(line_ids))
+                if incidence_values[i, j] != 0
+            ]
+
     # Function to calculate the balance for each node and time
     def energy_balance_rule(model, node, t):
         """
         Calculate the energy balance for a given node and time.
 
-        This function calculates the energy balance for a specific node and time in a complex clearing algorithm. It iterates over the orders and adjusts the balance expression based on the bid type. It also adjusts the flow subtraction to account for actual connections if an incidence matrix is provided.
+        This function calculates the energy balance for a specific node and time in a complex clearing algorithm. It sums the accepted volumes of all orders at the node and time and the line flows connected to the node if an incidence matrix is provided.
 
         Args:
             model: The complex clearing model.
@@ -154,28 +179,21 @@ def market_clearing_opt_constraints(
             t: The time for which to calculate the energy balance.
 
         Returns:
-            bool: True if the energy balance is zero, False otherwise.
+            The energy balance constraint expression, or ``pyo.Constraint.Skip``
+            if the node has neither orders nor connected lines at time ``t``.
         """
+        order_terms = balance_terms.get((node, t), ())
+        line_terms = node_line_terms.get(node, ())
+        if not order_terms and not line_terms:
+            return pyo.Constraint.Skip
+
         balance_expr = 0.0  # Initialize the balance expression
-        # Iterate over orders to adjust the balance expression based on bid type
-        for order in orders:
-            if (
-                order["bid_type"] == "SB"
-                and order["node"] == node
-                and order["start_time"] == t
-            ):
-                balance_expr += order["volume"] * model.xs[order["bid_id"]]
-            elif order["bid_type"] in ["BB", "LB"] and order["node"] == node:
-                for start_time, volume in order["volume"].items():
-                    if start_time == t:
-                        balance_expr += volume * model.xb[order["bid_id"]]
+        for volume, var in order_terms:
+            balance_expr += volume * var
 
         # Add contributions from line flows based on the incidence matrix
-        if incidence_matrix is not None:
-            for line in model.lines:
-                incidence_value = incidence_matrix.loc[node, line]
-                if incidence_value != 0:
-                    balance_expr += incidence_value * model.flows[t, line]
+        for line, incidence_value in line_terms:
+            balance_expr += incidence_value * model.flows[t, line]
 
         return balance_expr == 0
 
@@ -296,8 +314,8 @@ def market_clearing_opt(
 
     func_objective(model, orders)
 
-    # Solve the model
-    instance = model.create_instance()
+    # Solve the model (a ConcreteModel needs no create_instance() copy)
+    instance = model
     results = solver.solve(instance, options=solver_options)
 
     # Fix all model.x to the values in the solution
@@ -552,6 +570,9 @@ class ComplexClearingRole(MarketRole):
         if "min_acceptance_ratio" in self.marketconfig.additional_fields:
             mode = "with_min_acceptance_ratio"
 
+        # bid_ids of orders rejected because of negative surplus
+        rejected_ids: set = set()
+
         # solve the market clearing problem
         while True:
             # solve the optimization with the current orderbook
@@ -571,22 +592,33 @@ class ComplexClearingRole(MarketRole):
                 raise Exception("infeasible")
 
             # extract dual from model.energy_balance
+            # isolated nodes without orders and lines have no balance constraint
+            # and therefore no price (None)
             market_clearing_prices = {}
             for node in self.nodes:
                 market_clearing_prices[node] = {
-                    t: instance.dual[instance.energy_balance[node, t]]
+                    t: (
+                        instance.dual[instance.energy_balance[node, t]]
+                        if (node, t) in instance.energy_balance
+                        else None
+                    )
                     for t in instance.T
                 }
 
             # check the surplus of each order and remove those with negative surplus
+            # all orders are checked against the same solution before the
+            # orderbook is updated
             orders_surplus = []
             for order in orderbook:
+                if order["bid_id"] in rejected_ids:
+                    continue
                 children = []
                 if with_linked_bids:
                     children = [
                         child
                         for child in child_orders
                         if child["parent_bid_id"] == order["bid_id"]
+                        and child["bid_id"] not in rejected_ids
                     ]
 
                 order_surplus = calculate_order_surplus(
@@ -602,10 +634,13 @@ class ComplexClearingRole(MarketRole):
                 # remove orders with negative profit
                 if order_surplus < 0:
                     rejected_orders.append(order)
-                    orderbook.remove(order)
+                    rejected_ids.add(order["bid_id"])
                     rejected_orders.extend(children)
-                    for child in children:
-                        orderbook.remove(child)
+                    rejected_ids.update(child["bid_id"] for child in children)
+
+            orderbook[:] = [
+                order for order in orderbook if order["bid_id"] not in rejected_ids
+            ]
 
             # check if all orders have positive surplus
             if all(order_surplus >= 0 for order_surplus in orders_surplus):
@@ -687,12 +722,13 @@ def calculate_order_surplus(
 
         # add the surplus of child linked bids if it is positive
         for child_order in children:
+            child_volume = sum(child_order["volume"].values())
             child_surplus = (
                 sum(
                     market_clearing_prices[child_order["node"]][t] * v
                     for t, v in child_order["volume"].items()
                 )
-                - child_order["price"] * bid_volume
+                - child_order["price"] * child_volume
             ) * pyo.value(instance.xb[child_order["bid_id"]])
             if child_surplus > 0:
                 order_surplus += child_surplus

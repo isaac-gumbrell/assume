@@ -64,6 +64,12 @@ class Learning(Role):
         # happens for the shared anchor role in staggered training. ``None``
         # means "use this role's own context" (normal single-world training).
         self._progress_timestamp: float | None = None
+        # Staggered training sets this so that buffer flushes only mark an update
+        # as pending; the trainer then runs one update per chunk for both worlds.
+        self.defer_policy_update = False
+        self._policy_update_pending = False
+        # timestamps that were already carried over once as incomplete
+        self._carried_timestamps: set = set()
         self.target_critics = {}
 
         device = "cpu"
@@ -258,60 +264,79 @@ class Learning(Role):
 
         # Get timestamps from cache we took
         all_timestamps = sorted(current_obs.keys())
-        if len(all_timestamps) > 1:
-            transition_fields = (
-                current_obs,
-                current_actions,
-                current_rewards,
-                current_noises,
-                current_regrets,
-                current_profits,
-                current_active,
-            )
-            incomplete_timestamps = []
-            for ts in all_timestamps:
-                unit_ids = current_obs[ts].keys()
-                if any(
-                    not field.get(ts, {}).get(unit_id)
-                    for unit_id in unit_ids
-                    for field in transition_fields
-                ):
-                    incomplete_timestamps.append(ts)
-
-            # Process only complete timesteps
-            timestamps_to_process = [
-                ts for ts in all_timestamps if ts not in incomplete_timestamps
-            ]
-            # Carry over incomplete timesteps to new cache dicts
-            for ts in incomplete_timestamps:
-                self.all_obs[ts] = current_obs[ts]
-                self.all_actions[ts] = current_actions[ts]
-                self.all_rewards[ts] = current_rewards[ts]
-                self.all_noises[ts] = current_noises[ts]
-                self.all_regrets[ts] = current_regrets[ts]
-                self.all_profits[ts] = current_profits[ts]
-                self.all_active[ts] = current_active[ts]
-
-            # Create filtered cache (only complete timesteps)
-            cache = {
-                "obs": {t: current_obs[t] for t in timestamps_to_process},
-                "actions": {t: current_actions[t] for t in timestamps_to_process},
-                "rewards": {t: current_rewards[t] for t in timestamps_to_process},
-                "noises": {t: current_noises[t] for t in timestamps_to_process},
-                "regret": {t: current_regrets[t] for t in timestamps_to_process},
-                "profit": {t: current_profits[t] for t in timestamps_to_process},
-                "active": {t: current_active[t] for t in timestamps_to_process},
-            }
-
-            # write data to output agent
-            self.write_rl_params_to_output(cache)
-
-            # if we are training also update the policy and write data into buffer
-            if not self.learning_config.evaluation_mode:
-                # Process cache in background
-                await self._store_to_buffer_and_update_sync(cache, self.device)
-        else:
+        if not all_timestamps:
             logger.warning("No experience retrieved to store in buffer at update step!")
+            return
+
+        transition_fields = (
+            current_obs,
+            current_actions,
+            current_rewards,
+            current_noises,
+            current_regrets,
+            current_profits,
+            current_active,
+        )
+        # A timestep is complete when every unit that reported an observation in
+        # this batch has all transition fields at that timestep.
+        expected_unit_ids = set()
+        for ts in all_timestamps:
+            expected_unit_ids.update(current_obs[ts].keys())
+        incomplete_timestamps = []
+        for ts in all_timestamps:
+            if any(
+                not field.get(ts, {}).get(unit_id)
+                for unit_id in expected_unit_ids
+                for field in transition_fields
+            ):
+                incomplete_timestamps.append(ts)
+
+        # Process only complete timesteps
+        timestamps_to_process = [
+            ts for ts in all_timestamps if ts not in incomplete_timestamps
+        ]
+        # Carry over incomplete timesteps to new cache dicts, but only once, so
+        # a timestep that never completes cannot accumulate forever.
+        carried_timestamps = set()
+        for ts in incomplete_timestamps:
+            if ts in self._carried_timestamps:
+                logger.warning(
+                    f"Dropping RL transition at {ts}: still incomplete after being "
+                    "carried over to the next buffer update."
+                )
+                continue
+            carried_timestamps.add(ts)
+            self.all_obs[ts] = current_obs[ts]
+            self.all_actions[ts] = current_actions[ts]
+            self.all_rewards[ts] = current_rewards[ts]
+            self.all_noises[ts] = current_noises[ts]
+            self.all_regrets[ts] = current_regrets[ts]
+            self.all_profits[ts] = current_profits[ts]
+            self.all_active[ts] = current_active[ts]
+        self._carried_timestamps = carried_timestamps
+
+        if not timestamps_to_process:
+            logger.debug("No complete RL transitions to store at this update step.")
+            return
+
+        # Create filtered cache (only complete timesteps)
+        cache = {
+            "obs": {t: current_obs[t] for t in timestamps_to_process},
+            "actions": {t: current_actions[t] for t in timestamps_to_process},
+            "rewards": {t: current_rewards[t] for t in timestamps_to_process},
+            "noises": {t: current_noises[t] for t in timestamps_to_process},
+            "regret": {t: current_regrets[t] for t in timestamps_to_process},
+            "profit": {t: current_profits[t] for t in timestamps_to_process},
+            "active": {t: current_active[t] for t in timestamps_to_process},
+        }
+
+        # write data to output agent
+        self.write_rl_params_to_output(cache)
+
+        # if we are training also update the policy and write data into buffer
+        if not self.learning_config.evaluation_mode:
+            # Process cache in background
+            await self._store_to_buffer_and_update_sync(cache, self.device)
 
     async def _store_to_buffer_and_update_sync(self, cache, device) -> None:
         """
@@ -332,6 +357,9 @@ class Learning(Role):
         # role itself, so this is identical to the previous behaviour.
         buffer_unit_order = list(self.rl_algorithm.learning_role.rl_strats.keys())
         expected_unit_ids = set(buffer_unit_order)
+
+        if not cache["obs"]:
+            return
 
         first_start = next(iter(cache["obs"]))
         for name, buffer in [
@@ -380,10 +408,14 @@ class Learning(Role):
             # so the LR/noise schedule advances with real progress. In
             # single-world training this is ``self`` and a no-op; in staggered
             # training it overrides the anchor role's stale clock.
-            self.rl_algorithm.learning_role._progress_timestamp = (
-                self.context.current_timestamp
-            )
-            self.rl_algorithm.update_policy()
+            shared_role = self.rl_algorithm.learning_role
+            shared_role._progress_timestamp = self.context.current_timestamp
+            if self.defer_policy_update:
+                # staggered training: the trainer runs one update per chunk
+                # after both worlds have written their transitions
+                shared_role._policy_update_pending = True
+            else:
+                self.rl_algorithm.update_policy()
 
     def add_observation_to_cache(self, unit_id, start, observation) -> None:
         """
@@ -858,6 +890,9 @@ class Learning(Role):
         """
         output_agent_list = []
 
+        if not cache["obs"]:
+            return
+
         for unit_id in sorted(cache["obs"][next(iter(cache["obs"]))].keys()):
             starts = cache["obs"].keys()
             for idx, start in enumerate(starts):
@@ -931,9 +966,9 @@ class Learning(Role):
             A list of dictionaries containing critic losses for each time step.
             Each dictionary maps critic names to their corresponding loss values.
         """
-        # Use the algorithm runtime counter as the source of truth. This avoids
-        # collisions in staggered training where update_policy() can be called
-        # more than once per train_freq chunk.
+        # Use the algorithm runtime counter as the source of truth. In staggered
+        # training the shared algorithm is updated by the trainer rather than by
+        # this role, so per-role counters would not match the update count.
         gradient_steps_done: int
         n_updates = getattr(getattr(self, "rl_algorithm", None), "n_updates", None)
         if n_updates is not None:

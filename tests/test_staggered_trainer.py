@@ -3,8 +3,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from assume.reinforcement_learning.staggered_trainer import _share_learning_state
+from assume.reinforcement_learning.staggered_trainer import (
+    StaggeredTrainer,
+    _share_learning_state,
+)
 
 
 def test_share_learning_state_does_not_reinit_when_actors_loaded():
@@ -79,3 +83,27 @@ def test_share_learning_state_shares_action_noise():
     # Secondary strategy should now reference the anchor's action_noise object,
     # so a single decay update mutates the noise seen by both worlds.
     assert secondary_role.rl_strats["u1"].action_noise is anchor_noise
+
+
+def test_pending_policy_update_runs_once_per_chunk():
+    """Both worlds flushing in one chunk results in a single policy update."""
+    update_policy = MagicMock()
+    shared_role = SimpleNamespace(_policy_update_pending=False)
+    shared_role.rl_algorithm = SimpleNamespace(
+        learning_role=shared_role, update_policy=update_policy
+    )
+    trainer = object.__new__(StaggeredTrainer)
+    trainer.anchor = SimpleNamespace(learning_role=shared_role)
+
+    # nothing flushed: no update
+    trainer._run_pending_policy_update()
+    update_policy.assert_not_called()
+
+    # both worlds flush in the same chunk and mark the shared update as pending
+    shared_role._policy_update_pending = True
+    shared_role._policy_update_pending = True
+    trainer._run_pending_policy_update()
+    trainer._run_pending_policy_update()
+
+    update_policy.assert_called_once()
+    assert shared_role._policy_update_pending is False

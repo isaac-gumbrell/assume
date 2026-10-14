@@ -9,7 +9,10 @@ Orchestrates two persistent ``World`` instances that share one MATD3
 actor/critic and one replay buffer. Within each training episode, both worlds
 advance in *paired-sequential chunks* of ``train_freq`` hours: world A is
 advanced over a chunk, then world B over the same chunk, then a single batch of
-gradient updates is applied to the shared policy.
+gradient updates is applied to the shared policy. Both worlds only write their
+transitions into the shared buffer during the chunk (``defer_policy_update``);
+the trainer runs ``update_policy`` once after each chunk pair, so each chunk
+applies ``gradient_steps`` gradient steps in total.
 
 See ``.isaac_docs/d3_staggered_training_implementation.md`` for the full design.
 """
@@ -360,6 +363,7 @@ class StaggeredTrainer:
             inter_episodic_data["episodes_done"] = episode
 
             # Evaluation run
+            terminate = False
             do_eval = (
                 episode % validation_interval == 0
                 and episode
@@ -409,8 +413,6 @@ class StaggeredTrainer:
                 metrics = {"avg_reward": avg_reward, **per_scenario_avg}
                 terminate = self.anchor.learning_role.compare_and_save_policies(metrics)
                 inter_episodic_data["eval_episodes_done"] = eval_episode
-                if terminate:
-                    break
                 eval_episode += 1
 
             for w in self.worlds:
@@ -421,6 +423,12 @@ class StaggeredTrainer:
                 >= learning_config.episodes_collecting_initial_experience
                 + validation_interval
             ):
+                # keep the saved runtime state in sync with the loop counters
+                anchor_role = self.anchor.learning_role
+                anchor_role.episodes_done = inter_episodic_data["episodes_done"]
+                anchor_role.eval_episodes_done = inter_episodic_data[
+                    "eval_episodes_done"
+                ]
                 self.anchor.learning_role.rl_algorithm.save_params(
                     directory=f"{learning_config.trained_policies_save_path}/last_policies"
                 )
@@ -440,6 +448,10 @@ class StaggeredTrainer:
                         else default_state_path
                     )
                     self.anchor.learning_role.save_runtime_state(state_save_path)
+
+            # early stopping: stop after the checkpoint above has been saved
+            if terminate:
+                break
 
         logger.info("################")
         logger.info("Staggered training finished, starting evaluation run")
@@ -468,6 +480,9 @@ class StaggeredTrainer:
         """
         for w in self.worlds:
             w.learning_role.load_inter_episodic_data(inter_episodic_data)
+            # buffer flushes only mark an update as pending; the trainer runs
+            # one update per chunk after both worlds have stepped
+            w.learning_role.defer_policy_update = True
         # Re-share AFTER load so secondary gets anchor's up-to-date actor refs.
         _share_learning_state(self.anchor, self.secondary)
         self.secondary.learning_role.buffer = self.anchor.learning_role.buffer
@@ -573,8 +588,27 @@ class StaggeredTrainer:
                     for chunk_start, chunk_end in boundaries:
                         for w in order:
                             await w.async_run_chunk(chunk_start, chunk_end)
+                        # let any pending flush tasks finish, then update once
+                        await asyncio.sleep(0)
+                        self._run_pending_policy_update()
                         pbar.update(1)
                 finally:
                     pbar.close()
 
         loop.run_until_complete(_drive())
+
+    def _run_pending_policy_update(self) -> None:
+        """Run one policy update if a buffer flush of either world requested it.
+
+        Both worlds write into the shared buffer and mark the update as pending
+        on the shared algorithm's learning role instead of updating directly.
+        Running it here gives one update (``gradient_steps`` steps) per chunk.
+        """
+        anchor_role = getattr(self.anchor, "learning_role", None)
+        if anchor_role is None or getattr(anchor_role, "rl_algorithm", None) is None:
+            return
+        shared_role = anchor_role.rl_algorithm.learning_role
+        if not getattr(shared_role, "_policy_update_pending", False):
+            return
+        shared_role._policy_update_pending = False
+        shared_role.rl_algorithm.update_policy()

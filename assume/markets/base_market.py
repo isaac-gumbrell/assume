@@ -317,6 +317,10 @@ class MarketRole(MarketMechanism, Role):
         Validates a given orderbook.
 
         This is needed to check if all required fields for this mechanism are present.
+        The orderbook is modified in place: prices and volumes (including per-hour
+        values of block and linked bids) are clipped to the market limits, and orders
+        with any product outside the open auctions are removed together with their
+        linked children.
 
         Args:
             orderbook (Orderbook): The orderbook to be validated.
@@ -367,49 +371,113 @@ class MarketRole(MarketMechanism, Role):
                         f"Missing required field '{field}' for order {order} in market '{market_id}'."
                     )
 
-        # Process separated orders
-        sep_orders = separate_orders(orderbook.copy())
-        for order in sep_orders:
-            # Adjust order price if it exceeds max_price or is below min_price
-            if order["price"] > max_price:
+        def clip_price(price):
+            if price > max_price:
                 logger.warning(
-                    f"Order price {order['price']} exceeds maximum price {max_price} in market '{market_id}'. Setting to max_price."
+                    "Order price %s exceeds maximum price %s in market '%s'. Setting to max_price.",
+                    price,
+                    max_price,
+                    market_id,
                 )
-                order["price"] = max_price
-            elif order["price"] < min_price:
+                return max_price
+            if price < min_price:
                 logger.warning(
-                    f"Order price {order['price']} is below minimum price {min_price} in market '{market_id}'. Setting to min_price."
+                    "Order price %s is below minimum price %s in market '%s'. Setting to min_price.",
+                    price,
+                    min_price,
+                    market_id,
                 )
-                order["price"] = min_price
+                return min_price
+            return price
 
-            # Check that the product is part of an open auction
-            product = (order["start_time"], order["end_time"], order["only_hours"])
-            if product not in self.open_auctions:
+        def clip_volume(volume):
+            if abs(volume) > max_volume:
                 logger.warning(
-                    f"Product {product} is not part of an open auction in market '{market_id}'. Skipping this order."
+                    "Order volume %s exceeds max_volume %s in market '%s'. Adjusting volume.",
+                    volume,
+                    max_volume,
+                    market_id,
                 )
-                continue  # Skip to the next order
+                return max_volume if volume > 0 else -max_volume
+            return volume
 
-            # Adjust order volume if it exceeds max_volume
-            if abs(order["volume"]) > max_volume:
+        # Validate the original orders in place, so that clipping also applies
+        # to block and linked bids (whose price/volume may be per-hour dicts).
+        kept = []
+        dropped_bid_ids = set()
+        for order in orderbook:
+            # Every product (each hour of a block bid) must be part of an open auction
+            closed_products = [
+                (single["start_time"], single["end_time"], single["only_hours"])
+                for single in separate_orders([order])
+                if (single["start_time"], single["end_time"], single["only_hours"])
+                not in self.open_auctions
+            ]
+            if closed_products:
                 logger.warning(
-                    f"Order volume {order['volume']} exceeds max_volume {max_volume} in market '{market_id}'. Adjusting volume."
+                    "Products %s are not part of an open auction in market '%s'. Skipping order %s.",
+                    closed_products,
+                    market_id,
+                    order.get("bid_id"),
                 )
-                order["volume"] = max_volume if order["volume"] > 0 else -max_volume
+                if order.get("bid_id") is not None:
+                    dropped_bid_ids.add(order["bid_id"])
+                continue
+
+            for key, clip in (("price", clip_price), ("volume", clip_volume)):
+                if isinstance(order[key], dict):
+                    order[key] = {k: clip(v) for k, v in order[key].items()}
+                else:
+                    order[key] = clip(order[key])
 
             # Ensure 'price' is an integer if price_tick is set
             if self.marketconfig.price_tick:
-                if not isinstance(order["price"], int):
+                prices = (
+                    order["price"].values()
+                    if isinstance(order["price"], dict)
+                    else [order["price"]]
+                )
+                if not all(isinstance(price, int) for price in prices):
                     raise TypeError(
                         f"Order price {order['price']} must be an integer when price_tick is set in market '{market_id}'."
                     )
 
             # Ensure 'volume' is an integer if volume_tick is set
             if self.marketconfig.volume_tick:
-                if not isinstance(order["volume"], int):
+                volumes = (
+                    order["volume"].values()
+                    if isinstance(order["volume"], dict)
+                    else [order["volume"]]
+                )
+                if not all(isinstance(volume, int) for volume in volumes):
                     raise TypeError(
                         f"Order volume {order['volume']} must be an integer when volume_tick is set in market '{market_id}'."
                     )
+
+            kept.append(order)
+
+        # Drop linked children whose parent order was dropped
+        while dropped_bid_ids:
+            orphans = [
+                order
+                for order in kept
+                if order.get("parent_bid_id") is not None
+                and order["parent_bid_id"] in dropped_bid_ids
+            ]
+            if not orphans:
+                break
+            orphan_ids = {id(order) for order in orphans}
+            kept = [order for order in kept if id(order) not in orphan_ids]
+            dropped_bid_ids = {
+                order["bid_id"] for order in orphans if order.get("bid_id") is not None
+            }
+            logger.warning(
+                "Skipping linked orders %s in market '%s' because their parent order was skipped.",
+                sorted(dropped_bid_ids, key=str),
+                market_id,
+            )
+
+        orderbook[:] = kept
 
     def handle_registration(self, content: RegistrationMessage, meta: MetaDict):
         """

@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 # database operations slower than this (in seconds) are logged as warnings
 SLOW_DB_OPERATION_SECONDS = 5.0
+# number of store_dfs calls a failing write is retried before its data is dropped
+MAX_WRITE_ATTEMPTS = 3
 
 # additional per-table indexes speeding up per-episode reads of RL results
 RL_EPISODE_INDEX_TABLES = ("rl_params", "rl_grad_params")
@@ -109,6 +111,9 @@ class WriteOutput(Role):
         # initializes dfs for storing and writing asynchronous
         self.write_buffers: dict = defaultdict(list)
         self.locks = defaultdict(lambda: Lock())
+        # converted dataframes whose write failed, per table, as
+        # [df, destinations still to write ("csv"/"db"), failed attempts]
+        self._pending_writes: dict[str, list[list]] = defaultdict(list)
 
         self.kpi_defs: dict[str, OutputDef] = {
             "avg_price": {
@@ -588,34 +593,78 @@ class WriteOutput(Role):
             # check for any float64 columns and convert them to floats
             df = df.map(lambda x: float(x) if isinstance(x, np.float64) else x)
 
+            destinations = set()
             if self.export_csv_path:
-                data_path = self.export_csv_path / f"{table}.csv"
-                df.to_csv(
-                    data_path,
-                    mode="a",
-                    header=not data_path.exists(),
-                    float_format="%.5g",
-                )
-
+                destinations.add("csv")
             if self.db is not None:
-                start_time = time.perf_counter()
+                destinations.add("db")
+            self._pending_writes[table].append([df, destinations, 0])
+
+        # write all pending dataframes in order; failed writes are kept and
+        # retried on the next call for the destinations not yet written
+        for table, pending in self._pending_writes.items():
+            while pending:
+                entry = pending[0]
+                df, destinations = entry[0], entry[1]
                 try:
-                    with self.db.begin() as db:
-                        df.to_sql(table, db, if_exists="append")
-                except (
-                    ProgrammingError,
-                    OperationalError,
-                    DataError,
-                    IntegrityError,
-                    pd.errors.DatabaseError,
-                ):
-                    self.check_columns(table, df)
-                    # now try again
-                    with self.db.begin() as db:
-                        df.to_sql(table, db, if_exists="append")
-                self._log_db_duration("insert", table, start_time, len(df))
+                    if "csv" in destinations:
+                        data_path = self.export_csv_path / f"{table}.csv"
+                        df.to_csv(
+                            data_path,
+                            mode="a",
+                            header=not data_path.exists(),
+                            float_format="%.5g",
+                        )
+                        destinations.discard("csv")
+                    if "db" in destinations:
+                        self._write_df_to_db(table, df)
+                        destinations.discard("db")
+                except Exception:
+                    entry[2] += 1
+                    if entry[2] >= MAX_WRITE_ATTEMPTS:
+                        logger.exception(
+                            "Could not store %d rows of %s to %s after %d attempts; dropping them",
+                            len(df),
+                            table,
+                            sorted(destinations),
+                            entry[2],
+                        )
+                        pending.pop(0)
+                        continue
+                    logger.exception(
+                        "Could not store %d rows of %s to %s; retrying on next write",
+                        len(df),
+                        table,
+                        sorted(destinations),
+                    )
+                    break
+                pending.pop(0)
 
         self.current_dfs_size_bytes = 0
+
+    def _write_df_to_db(self, table: str, df: pd.DataFrame):
+        """
+        Appends a dataframe to a database table. If the insert fails because
+        the table is missing columns, the columns are added and the insert is
+        retried once. Other errors are raised.
+        """
+        start_time = time.perf_counter()
+        try:
+            with self.db.begin() as db:
+                df.to_sql(table, db, if_exists="append")
+        except (
+            ProgrammingError,
+            OperationalError,
+            DataError,
+            IntegrityError,
+            pd.errors.DatabaseError,
+        ):
+            if not self.check_columns(table, df):
+                raise
+            # now try again
+            with self.db.begin() as db:
+                df.to_sql(table, db, if_exists="append")
+        self._log_db_duration("insert", table, start_time, len(df))
 
     def store_grid(
         self,
@@ -696,7 +745,11 @@ class WriteOutput(Role):
         Args:
             table (str): The name of the database table.
             df (pandas.DataFrame): The DataFrame to be checked.
+
+        Returns:
+            bool: True if at least one column was added to the table.
         """
+        added = False
         with self.db.begin() as db:
             # Read table into Pandas DataFrame
             query = f"select * from {table} where 1=0"
@@ -715,17 +768,21 @@ class WriteOutput(Role):
                     query = f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
                     with self.db.begin() as db:
                         db.execute(text(query))
+                    added = True
                 except Exception:
                     logger.exception("Error converting column")
 
         if index and df.index.name:
             df.index.name = df.index.name.lower()
             if df.index.name in db_columns:
-                return
+                return added
             column_type = "float" if is_numeric_dtype(df.index) else "text"
             query = f"ALTER TABLE {table} ADD COLUMN {df.index.name} {column_type}"
             with self.db.begin() as db:
                 db.execute(text(query))
+            added = True
+
+        return added
 
     async def on_stop(self):
         """
@@ -737,6 +794,17 @@ class WriteOutput(Role):
 
         # insert left records into db
         await self.store_dfs()
+
+        unwritten = {
+            table: sum(len(entry[0]) for entry in pending)
+            for table, pending in self._pending_writes.items()
+            if pending
+        }
+        if unwritten:
+            logger.error(
+                "Output data could not be stored before shutdown (rows per table): %s",
+                unwritten,
+            )
 
         if self.db is None:
             return
@@ -758,10 +826,24 @@ class WriteOutput(Role):
         in the kpis table and the CSV export.
         """
         if self.learning_mode or self.evaluation_mode:
+            # rl_params rows of evaluation runs are stored with the eval episode
+            episode = self.eval_episode if self.evaluation_mode else self.episode
+            params = {
+                "episode": episode,
+                "simulation": self.simulation_id,
+                "evaluation_mode": bool(self.evaluation_mode),
+            }
             queries = [
-                f"SELECT 'sum_reward' as variable, simulation as ident, sum(reward) as value FROM rl_params WHERE episode='{self.episode}' AND simulation='{self.simulation_id}' GROUP BY simulation",
-                f"SELECT 'sum_regret' as variable, simulation as ident, sum(regret) as value FROM rl_params WHERE episode='{self.episode}' AND simulation='{self.simulation_id}' GROUP BY simulation",
-                f"SELECT 'sum_profit' as variable, simulation as ident, sum(profit) as value FROM rl_params WHERE episode='{self.episode}' AND simulation='{self.simulation_id}' GROUP BY simulation",
+                text(
+                    f"SELECT '{variable}' as variable, simulation as ident, sum({column}) as value "
+                    "FROM rl_params WHERE episode = :episode AND simulation = :simulation "
+                    "AND evaluation_mode = :evaluation_mode GROUP BY simulation"
+                ).bindparams(**params)
+                for variable, column in [
+                    ("sum_reward", "reward"),
+                    ("sum_regret", "regret"),
+                    ("sum_profit", "profit"),
+                ]
             ]
         else:
             queries = []

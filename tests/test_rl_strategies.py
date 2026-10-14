@@ -405,7 +405,9 @@ def test_srmc_zero_capacity_completes_learning_transition(
             "get_actions",
             return_value=(th.tensor([0.0]), th.tensor([0.0])),
         ),
-        patch.object(PowerPlant, "calculate_min_max_power", return_value=([0.0], [0.0])),
+        patch.object(
+            PowerPlant, "calculate_min_max_power", return_value=([0.0], [0.0])
+        ),
         patch.object(PowerPlant, "calculate_marginal_cost", return_value=0.0),
     ):
         bids = strategy.calculate_bids(
@@ -456,7 +458,9 @@ def test_srmc_uniform_initial_exploration_covers_action_range():
     strategy.collect_initial_experience_mode = True
     observation = th.zeros(strategy.obs_dim, dtype=strategy.float_type)
 
-    with patch("assume.strategies.learning_strategies.th.rand", return_value=th.tensor([0.75])):
+    with patch(
+        "assume.strategies.learning_strategies.th.rand", return_value=th.tensor([0.75])
+    ):
         action, noise = strategy.get_actions(observation)
 
     assert action.item() == pytest.approx(0.5)
@@ -711,6 +715,42 @@ def test_congestion_line_order_stability():
     assert list(s1.congestion_line_obs.keys()) == sorted(
         ff.congestion_signal_lines.keys()
     )
+
+
+@pytest.mark.require_learning
+def test_congestion_signal_line_count_mismatch_raises():
+    """A non-empty signal dict that does not cover n_lines must fail loudly
+    instead of producing a shorter observation."""
+    from assume.common.fast_pandas import FastSeries
+
+    index = pd.date_range("2023-06-30 22:00:00", periods=48, freq="h")
+    ff = PowerplantForecaster(
+        index,
+        fuel_prices={"lignite": 10, "co2": 10},
+        residual_load={"EOM": 0},
+    )
+    for line_id in ["line_A", "line_B"]:
+        ff.congestion_signal_lines[line_id] = FastSeries(value=0.0, index=ff.index)
+
+    lr = _make_learning_role(start, end)
+    strategy = _make_congestion_strategy(EnergyLearningStrategyCongestion, 3, 1, lr)
+    pp = PowerPlant(
+        id="pp1",
+        unit_operator="op",
+        technology="coal",
+        index=ff.index,
+        max_power=1000,
+        min_power=200,
+        efficiency=0.5,
+        additional_cost=10,
+        fuel_type="lignite",
+        emission_factor=0.5,
+        forecaster=ff,
+        bidding_strategies={"EOM": strategy},
+    )
+
+    with pytest.raises(ValueError, match="n_lines=3"):
+        strategy.prepare_observations(pp, "EOM")
 
 
 # ---------------------------------------------------------------------------

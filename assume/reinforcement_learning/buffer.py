@@ -147,23 +147,42 @@ class ReplayBuffer:
             reward (numpy.ndarray): The reward to add.
             mask (numpy.ndarray, optional): Per-agent activity mask (1.0 = trainable,
                 0.0 = forced off). Defaults to all-ones when omitted.
-        """
-        # copying all to avoid modification
-        len_obs = obs.shape[0]
-        self.observations[self.pos : self.pos + len_obs] = obs.copy()
-        self.actions[self.pos : self.pos + len_obs] = actions.copy()
-        self.rewards[self.pos : self.pos + len_obs] = np.squeeze(
-            reward.copy(), axis=-1
-        )  # alsways one reward value per agent and time-step hence squezze
-        if mask is None:
-            self.masks[self.pos : self.pos + len_obs] = 1.0
-        else:
-            self.masks[self.pos : self.pos + len_obs] = mask.copy()
 
-        self.pos += len_obs
+        Note:
+            Rows are written circularly: when the end of the buffer is reached,
+            writing continues at the start and overwrites the oldest rows. If more
+            rows than ``buffer_size`` are added at once, only the newest
+            ``buffer_size`` rows are kept.
+        """
+        len_obs = obs.shape[0]
+        if len_obs == 0:
+            return
+
+        # always one reward value per agent and time-step hence squeeze
+        reward = np.squeeze(reward, axis=-1)
+        if mask is None:
+            mask = np.ones((len_obs, self.n_rl_units), dtype=self.np_float_type)
+
+        if len_obs > self.buffer_size:
+            # keep only the newest rows, as if they had been added one by one
+            dropped = len_obs - self.buffer_size
+            obs = obs[dropped:]
+            actions = actions[dropped:]
+            reward = reward[dropped:]
+            mask = mask[dropped:]
+            self.pos = (self.pos + dropped) % self.buffer_size
+            len_obs = self.buffer_size
+
+        # fancy-index assignment copies the data, so the inputs are not referenced
+        idx = (self.pos + np.arange(len_obs)) % self.buffer_size
+        self.observations[idx] = obs
+        self.actions[idx] = actions
+        self.rewards[idx] = reward
+        self.masks[idx] = mask
+
         if self.pos + len_obs >= self.buffer_size:
             self.full = True
-            self.pos = 0
+        self.pos = (self.pos + len_obs) % self.buffer_size
 
     def sample(self, batch_size: int) -> ReplayBufferSamples:
         """
@@ -178,21 +197,31 @@ class ReplayBuffer:
 
         Raises:
             Exception: If there are less than two entries in the buffer.
+
+        Note:
+            The next observation of row ``i`` is row ``(i + 1) % buffer_size``.
+            The newest row has no successor yet and is never sampled.
         """
 
         upper_bound = self.buffer_size if self.full else self.pos
         if upper_bound < 2:
             raise Exception("at least two entries needed to sample")
-        batch_inds = np.random.randint(0, upper_bound - 1, size=batch_size)
+        offsets = np.random.randint(0, upper_bound - 1, size=batch_size)
+        if self.full:
+            # start at the oldest row (pos) and skip the newest row (pos - 1)
+            batch_inds = (self.pos + offsets) % self.buffer_size
+        else:
+            batch_inds = offsets
+        next_inds = (batch_inds + 1) % self.buffer_size
 
         data = (
             self.observations[batch_inds, :, :],
             self.actions[batch_inds, :, :],
-            self.observations[batch_inds + 1, :, :],
-            self.actions[batch_inds + 1, :, :],
+            self.observations[next_inds, :, :],
+            self.actions[next_inds, :, :],
             self.rewards[batch_inds],
             self.masks[batch_inds],
-            self.masks[batch_inds + 1],
+            self.masks[next_inds],
         )
 
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))

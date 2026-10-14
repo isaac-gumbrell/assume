@@ -814,6 +814,11 @@ class LearningConfig:
             weight to long-term rewards in decision-making. Default is 0.99.
         actor_architecture (str): The architecture of the neural networks used for the actors. Options include
             "mlp" (Multi-Layer Perceptron) and "lstm" (Long Short-Term Memory). Default is "mlp".
+        critic_hidden_sizes (list[int] | None): Hidden layer sizes of the centralised critic, e.g. [512, 256, 128].
+            If None, the size is chosen from the number of learning agents: up to 20 agents use [256, 128],
+            up to 50 use [512, 256, 128], more use [1024, 512, 256, 128]. Smaller critics train faster and
+            use less memory. Changing this makes saved critics, learning state and replay buffers from
+            earlier runs incompatible, so use a fresh trained_policies_save_path. Default is None.
         policy_delay (int): The frequency (in gradient steps) at which the actor policy is updated.
             TD3 updates the critic more frequently than the actor to stabilize training. Default is 2.
         noise_sigma (float): The standard deviation of the Ornstein-Uhlenbeck or Gaussian noise distribution

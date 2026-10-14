@@ -17,7 +17,10 @@ try:
     import torch as th
 
     from assume.common.base import LearningStrategy
-    from assume.reinforcement_learning.algorithms.matd3 import atomic_torch_save
+    from assume.reinforcement_learning.algorithms.matd3 import (
+        CriticArchitectureMismatchError,
+        atomic_torch_save,
+    )
     from assume.reinforcement_learning.learning_role import Learning
     from assume.reinforcement_learning.learning_utils import (
         get_hidden_sizes,
@@ -598,3 +601,20 @@ def test_transfer_weights_various_orders(prefix, new_id_order):
         b_key = f"{prefix}.{i}.bias"
         assert th.equal(new_state[w_key], old_state[w_key])
         assert th.equal(new_state[b_key], old_state[b_key])
+
+
+@pytest.mark.require_learning
+def test_load_critic_params_raises_on_hidden_size_mismatch(
+    base_learning_config, saved_n_agent_model
+):
+    save_dir, _ = saved_n_agent_model
+    config = copy(base_learning_config)
+    config["learning_config"] = deepcopy(config["learning_config"])
+    config["learning_config"].critic_hidden_sizes = [32, 16]
+    learn = Learning(config["learning_config"], start, end)
+    learn.rl_strats["agent_0"] = LearningStrategy(**config, learning_role=learn)
+    learn.rl_strats["agent_1"] = LearningStrategy(**config, learning_role=learn)
+    learn.initialize_policy()
+
+    with pytest.raises(CriticArchitectureMismatchError, match="critic_hidden_sizes"):
+        learn.rl_algorithm.load_critic_params(save_dir)
