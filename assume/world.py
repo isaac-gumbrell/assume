@@ -175,6 +175,9 @@ class World:
                         logger.error("%s", e)
                     time.sleep(2**attempts)
 
+            # the engine was only needed for the connection check
+            db.dispose()
+
             if not connected:
                 raise RuntimeError(
                     f"Failed to connect to the database after {max_attempts} attempts"

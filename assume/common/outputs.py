@@ -4,6 +4,7 @@
 
 import logging
 import shutil
+import time
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Lock
@@ -27,6 +28,12 @@ from assume.common.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# database operations slower than this (in seconds) are logged as warnings
+SLOW_DB_OPERATION_SECONDS = 5.0
+
+# additional per-table indexes speeding up per-episode reads of RL results
+RL_EPISODE_INDEX_TABLES = ("rl_params", "rl_grad_params")
 
 
 class OutputDef(TypedDict):
@@ -148,36 +155,106 @@ class WriteOutput(Role):
 
         # Loop throuph all database tables
         # Get list of table names in database
-        table_names = inspect(self.db).get_table_names()
+        inspector = inspect(self.db)
+        table_names = inspector.get_table_names()
         # Iterate through each table
         for table_name in table_names:
             # ignore spatial_ref_sys table
             if table_name == "spatial_ref_sys":
                 continue
+
+            # Index creation is kept out of the DELETE transaction: on PostgreSQL
+            # CREATE INDEX (even IF NOT EXISTS on an existing index) takes a SHARE
+            # lock which blocks INSERTs of all other sessions until commit.
+            try:
+                existing_indexes = {
+                    index["name"] for index in inspector.get_indexes(table_name)
+                }
+                self._ensure_index(
+                    table_name,
+                    f"{table_name}_scenario",
+                    ["simulation"],
+                    existing_indexes,
+                )
+                if table_name in RL_EPISODE_INDEX_TABLES:
+                    self._ensure_index(
+                        table_name,
+                        f"{table_name}_simulation_episode",
+                        ["simulation", "episode"],
+                        existing_indexes,
+                    )
+            except Exception as e:
+                logger.error(f"could not create index on table {table_name} - {e}")
+
             # only delete rl_params and rl_meta during the first episode of learning
             if table_name in ["rl_params", "rl_grad_params", "rl_meta"] and not (
                 self.learning_mode and self.episode == 1
             ):
                 continue
             try:
+                start_time = time.perf_counter()
                 with self.db.begin() as db:
-                    # create index on table
                     query = text(
-                        f'create index if not exists "{table_name}_scenario" on "{table_name}" (simulation)'
+                        f'delete from "{table_name}" where simulation = :simulation'
                     )
-                    db.execute(query)
-
-                    query = text(
-                        f"delete from \"{table_name}\" where simulation = '{simulation_id}'"
-                    )
-                    rowcount = db.execute(query).rowcount
-                    # has to be done manually with raw queries
-                    db.commit()
-                    logger.debug("deleted %s rows from %s", rowcount, table_name)
+                    rowcount = db.execute(query, {"simulation": simulation_id}).rowcount
+                self._log_db_duration(
+                    "delete", table_name, start_time, rowcount, simulation_id
+                )
             except Exception as e:
                 logger.error(
                     f"could not clear old scenarios from table {table_name} - {e}"
                 )
+
+    def _ensure_index(
+        self,
+        table_name: str,
+        index_name: str,
+        columns: list[str],
+        existing_indexes: set[str],
+    ):
+        """
+        Creates an index in its own short transaction, only if it does not exist yet.
+
+        Args:
+            table_name (str): The name of the database table.
+            index_name (str): The name of the index.
+            columns (list[str]): The columns of the index.
+            existing_indexes (set[str]): The names of the indexes already present on the table.
+        """
+        if index_name in existing_indexes:
+            return
+        column_list = ", ".join(f'"{column}"' for column in columns)
+        start_time = time.perf_counter()
+        with self.db.begin() as db:
+            db.execute(
+                text(
+                    f'create index if not exists "{index_name}" on "{table_name}" ({column_list})'
+                )
+            )
+        self._log_db_duration("create index", table_name, start_time)
+
+    def _log_db_duration(
+        self,
+        operation: str,
+        table_name: str,
+        start_time: float,
+        rowcount: int | None = None,
+        simulation_id: str | None = None,
+    ):
+        """
+        Logs the duration of a database operation, as warning if it was slow.
+        """
+        duration = time.perf_counter() - start_time
+        log = logger.warning if duration > SLOW_DB_OPERATION_SECONDS else logger.debug
+        log(
+            "db %s on %s took %.2fs (rows=%s, simulation=%s)",
+            operation,
+            table_name,
+            duration,
+            rowcount,
+            simulation_id or self.simulation_id,
+        )
 
     def setup(self):
         """
@@ -521,6 +598,7 @@ class WriteOutput(Role):
                 )
 
             if self.db is not None:
+                start_time = time.perf_counter()
                 try:
                     with self.db.begin() as db:
                         df.to_sql(table, db, if_exists="append")
@@ -535,6 +613,7 @@ class WriteOutput(Role):
                     # now try again
                     with self.db.begin() as db:
                         df.to_sql(table, db, if_exists="append")
+                self._log_db_duration("insert", table, start_time, len(df))
 
         self.current_dfs_size_bytes = 0
 
@@ -659,16 +738,25 @@ class WriteOutput(Role):
         # insert left records into db
         await self.store_dfs()
 
-        # Dispose the SQLAlchemy engine to release pooled connections
-        if self.db is not None:
+        if self.db is None:
+            return
+
+        try:
+            self.store_kpis()
+        finally:
+            # Dispose the SQLAlchemy engine to release pooled connections.
+            # This has to happen after the last query, as any later use of the
+            # engine silently opens a new pool which is never released.
             try:
                 self.db.dispose()
             except Exception:
                 pass
 
-        if self.db is None:
-            return
-
+    def store_kpis(self):
+        """
+        Queries the KPIs of this simulation from the database and stores them
+        in the kpis table and the CSV export.
+        """
         if self.learning_mode or self.evaluation_mode:
             queries = [
                 f"SELECT 'sum_reward' as variable, simulation as ident, sum(reward) as value FROM rl_params WHERE episode='{self.episode}' AND simulation='{self.simulation_id}' GROUP BY simulation",
@@ -734,8 +822,12 @@ class WriteOutput(Role):
         if self.db is None:
             return []
 
-        with self.db.begin() as db:
-            rewards_by_unit = db.execute(query).fetchall()
+        try:
+            with self.db.begin() as db:
+                rewards_by_unit = db.execute(query).fetchall()
+        finally:
+            # called after the simulation has stopped, release the connection
+            self.db.dispose()
 
         # convert into a numpy array
         rewards_by_unit = [r[1] for r in rewards_by_unit]

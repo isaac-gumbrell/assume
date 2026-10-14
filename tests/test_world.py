@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import asyncio
+from unittest.mock import patch
 
 from assume import World
 from assume.common.forecaster import DemandForecaster
@@ -24,6 +25,14 @@ def test_world_scenario():
     assert world.market_operators.keys()
     assert world.markets.keys()
     assert world.unit_operators.keys()
+
+
+def test_world_disposes_connection_check_engine(tmp_path):
+    with patch("assume.world.create_engine") as create_engine_mock:
+        World(database_uri=f"sqlite:///{tmp_path / 'test.db'}")
+
+    create_engine_mock.return_value.connect.assert_called_once()
+    create_engine_mock.return_value.dispose.assert_called_once()
 
 
 def test_world_operators_default():
