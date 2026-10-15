@@ -908,3 +908,24 @@ async def test_deferred_policy_update_sets_pending_flag():
     learn.buffer.add.assert_called_once()
     learn.rl_algorithm.update_policy.assert_not_called()
     assert learn._policy_update_pending is True
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize("save_eval_policies", [True, False])
+def test_compare_and_save_policies_respects_save_eval_policies(save_eval_policies):
+    config = _progress_config()
+    config["learning_config"].trained_policies_save_path = "policies"
+    config["learning_config"].save_eval_policies = save_eval_policies
+    learn = Learning(config["learning_config"], start=start, end=end)
+    learn.rl_algorithm = MagicMock()
+
+    learn.compare_and_save_policies({"avg_reward": 1.0})
+
+    # metric tracking is unaffected by the flag
+    assert learn.max_eval["avg_reward"] == 1.0
+    if save_eval_policies:
+        learn.rl_algorithm.save_params.assert_called_once_with(
+            directory="policies/avg_reward_eval_policies"
+        )
+    else:
+        learn.rl_algorithm.save_params.assert_not_called()

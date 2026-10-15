@@ -773,7 +773,10 @@ class Learning(Role):
                 self.max_eval[metric] = self.rl_eval[metric][-1]
 
                 # use first metric as default
-                if metric == list(metrics.keys())[0]:
+                if (
+                    metric == list(metrics.keys())[0]
+                    and self.learning_config.save_eval_policies
+                ):
                     # store the best for our current metric in its folder
                     self.rl_algorithm.save_params(
                         directory=f"{self.learning_config.trained_policies_save_path}/{metric}_eval_policies"

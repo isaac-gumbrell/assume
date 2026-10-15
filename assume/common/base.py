@@ -845,6 +845,9 @@ class LearningConfig:
         learning_state_load_path (str | None): Optional explicit file path used when loading learning state.
             If None, defaults to learning_state_save_path if provided, otherwise
             <trained_policies_save_path>/last_policies/learning_state.pt.
+        save_eval_policies (bool): Whether to save the best-performing policies found during evaluation runs to
+            <trained_policies_save_path>/<metric>_eval_policies (e.g. avg_reward_eval_policies). Evaluation metrics
+            and early stopping are still tracked when False. Default is True.
 
     """
 
@@ -896,6 +899,7 @@ class LearningConfig:
     learning_state_save_path: str | None = None
     load_learning_state: bool = False
     learning_state_load_path: str | None = None
+    save_eval_policies: bool = True
 
     # Optional staggered (paired-scenario) training config — see D3 spec.
     # Expected shape:
