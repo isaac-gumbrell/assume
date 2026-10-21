@@ -1243,7 +1243,7 @@ def setup_world(
             world.add_units_with_operator_subprocess(op, op_units, strategies)
     else:
         logger.info("Adding unit operators and units")
-        for company_name in set(units.keys()):
+        for company_name in units.keys():
             strategies = unit_operators_strategies.get(company_name, {})
             world.add_unit_operator(id=str(company_name), strategies=strategies)
 

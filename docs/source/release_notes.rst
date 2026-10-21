@@ -27,6 +27,7 @@ Upcoming Release
   - **Fix bug in forecasts**, that occurred when using complex clearing
   - **Fix infeasible power output in PowerPlant**: ``calculate_min_max_power`` now correctly accounts for base load, positive/negative capacity reserves, and heat demand when computing additional power. If reduced availability makes the unit infeasible to run, both min and max power are set to 0. A warning is issued if previous dispatch exceeded available power.
   - **Fix upward redispatch potential**, so that availabilities are now correctly considered instead of the nominal power output of the unit
+  - **Fix non-deterministic results with equal-price bids**: The orderbook order no longer depends on ``PYTHONHASHSEED`` or on process timing in ``--parallel`` mode, so ties between equal-price bids are resolved reproducibly. (#861)
 
 0.6.1 - (25th March 2026)
 =========================
