@@ -280,12 +280,13 @@ def test_srmc_bid_price_remap(
     srmc_multiplier,
 ):
     """The action must be remapped linearly onto
-    ``[SRMC, min(max(SRMC * multiplier, upper floor), max_bid_price)]``.
+    ``[SRMC, min(max(SRMC * multiplier, SRMC + upper floor), max_bid_price)]``.
 
     ``action = -1`` bids exactly at SRMC, ``action = +1`` at the (capped) upper
     bound and ``action = 0`` at the midpoint. The full available capacity is
     offered as a single bid. The 1.4 multiplier exercises the 200 upper-bound
-    floor, while the 40.0 multiplier exercises the 700 global price cap.
+    floor (added on top of the SRMC), while the 40.0 multiplier exercises the
+    700 global price cap.
     """
     import torch as th
 
@@ -299,7 +300,7 @@ def test_srmc_bid_price_remap(
 
     srmc = 25.0
     upper_bound = min(
-        max(srmc * srmc_multiplier, strategy.srmc_upper_bound_floor),
+        max(srmc * srmc_multiplier, srmc + strategy.srmc_upper_bound_floor),
         strategy.max_bid_price,
     )
     expected_price = srmc + expected_fraction * (upper_bound - srmc)

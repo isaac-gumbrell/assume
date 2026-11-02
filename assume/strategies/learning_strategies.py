@@ -898,13 +898,13 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     bid covering the unit's full available capacity. Instead of mapping the actor's action
     from ``[-1, 1]`` directly to ``[-max_bid_price, +max_bid_price]``, it remaps the action
         to the economically meaningful range
-        ``[SRMC, min(max(SRMC * srmc_multiplier, srmc_upper_bound_floor), max_bid_price)]``.
+        ``[SRMC, min(max(SRMC * srmc_multiplier, SRMC + srmc_upper_bound_floor), max_bid_price)]``.
     The SRMC is the unit's marginal cost at the current dispatch point, so the agent
     effectively learns a *markup* on top of its production cost:
 
     - ``action = -1`` bids exactly at SRMC (marginal-cost bidding, always cost-covering).
         - ``action = +1`` bids at the greater of ``SRMC * srmc_multiplier`` and
-            ``srmc_upper_bound_floor``, capped at ``max_bid_price``.
+            ``SRMC + srmc_upper_bound_floor``, capped at ``max_bid_price``.
 
     Bidding never falls below SRMC, which prevents the agent from submitting loss-making
     bids and focuses the learning signal on choosing the profit-maximising markup. Bounding
@@ -922,7 +922,8 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
             must be finite and >= 1 so the action range is never empty or inverted.
             Typically supplied via the global ``bidding_strategy_params`` config, e.g.
             ``srmc_multiplier: 1.4``.
-        srmc_upper_bound_floor (float): Minimum value of the upper bid bound before
+        srmc_upper_bound_floor (float): Minimum markup above SRMC of the upper bid bound
+            (i.e. the bound is at least ``SRMC + srmc_upper_bound_floor``) before
             capping at ``max_bid_price``. Required, finite, and non-negative. This keeps
             an effective action range for zero- and low-SRMC units, e.g. ``200``.
         **kwargs: Forwarded to :class:`EnergyLearningSingleBidStrategy`.
@@ -973,7 +974,7 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         Generate a single price bid for the full available capacity (max_power).
 
         Overrides the parent to remap the action space from ``[-1, 1]`` to
-        ``[SRMC, min(max(SRMC * srmc_multiplier, srmc_upper_bound_floor), max_bid_price)]``
+        ``[SRMC, min(max(SRMC * srmc_multiplier, SRMC + srmc_upper_bound_floor), max_bid_price)]``
         instead of ``[-max_bid_price, +max_bid_price]``. A linear remap (instead of
         clamping) preserves full gradient resolution across the valid bid range and
         guarantees bids never drop below the unit's SRMC.
