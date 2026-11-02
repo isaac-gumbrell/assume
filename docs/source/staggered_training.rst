@@ -123,15 +123,18 @@ Outputs and namespacing
 =======================
 
 Both worlds share the same database / CSV output directory, but each
-world's ``simulation_id`` is set to **its own scenario folder name** so
-rows never collide. After a run against the example fixture you can query::
+world's ``simulation_id`` is set to **its own scenario folder name plus the
+study case** (``<scenario>_<study_case>``) so rows never collide, neither
+between the paired worlds nor between different study cases of the same
+scenario. After a run against the example fixture you can query::
 
     SELECT DISTINCT simulation FROM rl_params;
-    -- staggered_bau
-    -- staggered_inv
+    -- staggered_bau_staggered
+    -- staggered_inv_staggered
 
 Per-world metrics also appear in TensorBoard under separate run
-directories (``tensorboard/staggered_bau`` and ``tensorboard/staggered_inv``).
+directories (``tensorboard/staggered_bau_staggered`` and
+``tensorboard/staggered_inv_staggered``).
 The evaluation reward reported by the trainer (``avg_reward``) is the mean
 across both worlds; per-scenario averages are emitted alongside as
 ``avg_reward_bau`` / ``avg_reward_inv``.

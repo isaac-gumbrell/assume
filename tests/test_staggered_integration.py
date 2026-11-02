@@ -167,8 +167,8 @@ def test_load_staggered_scenario_g4_foreign_units_neutralized():
 @pytest.mark.require_learning
 @pytest.mark.slow
 def test_load_staggered_scenario_namespaces_simulation_ids():
-    """Each world's ``simulation_id`` must be the scenario folder name and the
-    two ids must be distinct (so DB outputs do not collide).
+    """Each world's ``simulation_id`` must be ``<scenario folder>_<study_case>``
+    and the two ids must be distinct (so DB outputs do not collide).
     """
     _skip_if_fixture_missing()
     _clean_learned_strategies()
@@ -184,8 +184,8 @@ def test_load_staggered_scenario_namespaces_simulation_ids():
 
     sid_a = world_a.scenario_data["simulation_id"]
     sid_b = world_b.scenario_data["simulation_id"]
-    assert sid_a == FIXTURE_PRIMARY
-    assert sid_b == FIXTURE_PAIRED
+    assert sid_a == f"{FIXTURE_PRIMARY}_{FIXTURE_STUDY_CASE}"
+    assert sid_b == f"{FIXTURE_PAIRED}_{FIXTURE_STUDY_CASE}"
     assert sid_a != sid_b
     # No stutter:
     assert "_staggered_" not in sid_a
@@ -237,11 +237,13 @@ def test_run_staggered_learning_writes_namespaced_db_rows(tmp_path):
             r[0]
             for r in cur.execute("SELECT DISTINCT simulation FROM rl_params").fetchall()
         }
-        assert FIXTURE_PRIMARY in sims_in_rl_params, (
-            f"Expected '{FIXTURE_PRIMARY}' rows in rl_params, got {sims_in_rl_params}"
+        sim_a = f"{FIXTURE_PRIMARY}_{FIXTURE_STUDY_CASE}"
+        sim_b = f"{FIXTURE_PAIRED}_{FIXTURE_STUDY_CASE}"
+        assert sim_a in sims_in_rl_params, (
+            f"Expected '{sim_a}' rows in rl_params, got {sims_in_rl_params}"
         )
-        assert FIXTURE_PAIRED in sims_in_rl_params, (
-            f"Expected '{FIXTURE_PAIRED}' rows in rl_params, got {sims_in_rl_params}"
+        assert sim_b in sims_in_rl_params, (
+            f"Expected '{sim_b}' rows in rl_params, got {sims_in_rl_params}"
         )
     finally:
         con.close()
