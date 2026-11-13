@@ -10,6 +10,60 @@ from assume.common.base import MinMaxChargeStrategy, SupportsMinMaxCharge
 from assume.common.market_objects import MarketConfig, Orderbook, Product
 from assume.common.utils import parse_duration
 
+DEFAULT_STORAGE_HEURISTIC_FORESIGHT = "12h"
+STORAGE_HEURISTIC_FORESIGHT_KEYS = ("eom_foresight", "heuristic_foresight")
+
+
+def resolve_storage_heuristic_foresight(
+    eom_foresight: str | None,
+    heuristic_foresight: str | None,
+    read_key: str,
+) -> str:
+    """Resolve the storage heuristic foresight from the two config keys.
+
+    ``bidding_strategy_params`` is shared by every strategy, so both keys can reach
+    a storage heuristic. ``read_key`` is the key the calling strategy has always read.
+    The other key alone is ambiguous (older versions silently ignored it), and
+    conflicting values are rejected, so a configured foresight is never ignored.
+
+    Args:
+        eom_foresight: Value of ``eom_foresight`` or None if unset.
+        heuristic_foresight: Value of ``heuristic_foresight`` or None if unset.
+        read_key: ``"eom_foresight"`` or ``"heuristic_foresight"``.
+
+    Returns:
+        str: The foresight duration string.
+    """
+    if read_key not in STORAGE_HEURISTIC_FORESIGHT_KEYS:
+        raise ValueError(
+            f"read_key must be one of {STORAGE_HEURISTIC_FORESIGHT_KEYS}, got "
+            f"'{read_key}'."
+        )
+    values = {
+        "eom_foresight": eom_foresight,
+        "heuristic_foresight": heuristic_foresight,
+    }
+    other_key = next(key for key in STORAGE_HEURISTIC_FORESIGHT_KEYS if key != read_key)
+    read_value, other_value = values[read_key], values[other_key]
+
+    if read_value is None and other_value is None:
+        return DEFAULT_STORAGE_HEURISTIC_FORESIGHT
+    if read_value is None:
+        raise ValueError(
+            f"'{other_key}: {other_value}' is set but this storage strategy reads "
+            f"'{read_key}'. Set '{read_key}' to the same value to confirm the "
+            "storage heuristic foresight."
+        )
+    if other_value is not None and parse_duration(other_value) != parse_duration(
+        read_value
+    ):
+        raise ValueError(
+            f"Conflicting storage heuristic foresight: '{read_key}: {read_value}' "
+            f"and '{other_key}: {other_value}'. Set both to the same value."
+        )
+    parse_duration(read_value)
+    return read_value
+
 
 class StorageEnergyHeuristicFlexableStrategy(MinMaxChargeStrategy):
     """
@@ -33,7 +87,13 @@ class StorageEnergyHeuristicFlexableStrategy(MinMaxChargeStrategy):
     ):
         super().__init__(*args, **kwargs)
 
-        self.foresight = parse_duration(kwargs.get("eom_foresight", "12h"))
+        self.foresight = parse_duration(
+            resolve_storage_heuristic_foresight(
+                eom_foresight=kwargs.get("eom_foresight"),
+                heuristic_foresight=kwargs.get("heuristic_foresight"),
+                read_key="eom_foresight",
+            )
+        )
         if heuristic_schedule_price_source not in {"primary", "naive"}:
             raise ValueError(
                 "heuristic_schedule_price_source must be 'primary' or 'naive', got "

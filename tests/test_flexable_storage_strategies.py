@@ -160,6 +160,33 @@ def test_flexable_eom_storage_rejects_unknown_schedule_price_source():
         )
 
 
+@pytest.mark.parametrize(
+    "params, expected_hours",
+    [
+        ({}, 12),
+        ({"eom_foresight": "24h"}, 24),
+        ({"eom_foresight": "24h", "heuristic_foresight": "24h"}, 24),
+        ({"eom_foresight": "1d", "heuristic_foresight": "24h"}, 24),
+    ],
+)
+def test_flexable_eom_storage_foresight_resolution(params, expected_hours):
+    strategy = StorageEnergyHeuristicFlexableStrategy(**params)
+    assert strategy.foresight == timedelta(hours=expected_hours)
+
+
+@pytest.mark.parametrize(
+    "params, match",
+    [
+        ({"heuristic_foresight": "24h"}, "reads 'eom_foresight'"),
+        ({"eom_foresight": "12h", "heuristic_foresight": "24h"}, "Conflicting"),
+        ({"eom_foresight": "12"}, "Unsupported duration"),
+    ],
+)
+def test_flexable_eom_storage_foresight_errors(params, match):
+    with pytest.raises(ValueError, match=match):
+        StorageEnergyHeuristicFlexableStrategy(**params)
+
+
 def test_flexable_pos_crm_storage(mock_market_config, storage):
     index = pd.date_range("2023-07-01", periods=48, freq="h")
     start = datetime(2023, 7, 1)

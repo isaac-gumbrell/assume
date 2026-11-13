@@ -18,6 +18,7 @@ from assume.strategies.flexable_storage import (
     StorageCapacityHeuristicBalancingNegStrategy,
     StorageCapacityHeuristicBalancingPosStrategy,
 )
+from assume.strategies.scheduled_storage import StorageEnergyFixedScheduleStrategy
 from assume.strategies.naive_strategies import (
     DsmEnergyOptimizationStrategy,
     EnergyNaiveProfileStrategy,
@@ -76,6 +77,7 @@ bidding_strategies: dict[str, type[BaseStrategy | UnitOperatorStrategy]] = {
     "powerplant_capacity_heuristic_balancing_neg": CapacityHeuristicBalancingNegStrategy,
     "powerplant_capacity_heuristic_balancing_pos": CapacityHeuristicBalancingPosStrategy,
     "storage_energy_heuristic_flexable": StorageEnergyHeuristicFlexableStrategy,
+    "storage_energy_fixed_schedule": StorageEnergyFixedScheduleStrategy,
     "storage_capacity_heuristic_balancing_neg": StorageCapacityHeuristicBalancingNegStrategy,
     "storage_capacity_heuristic_balancing_pos": StorageCapacityHeuristicBalancingPosStrategy,
     "household_capacity_heuristic_balancing_pos": DsmCapacityHeuristicBalancingPosStrategy,
@@ -109,6 +111,7 @@ try:
         StorageEnergyLearningHeuristicStrategy,
         StorageEnergyLearningHeuristicStrategyCongestion,
         StorageEnergyLearningHeuristicDispatchStrategyCongestion,
+        StorageEnergyLearningScheduleDispatchStrategyCongestion,
         RenewableEnergyLearningSingleBidStrategy,
         RenewableEnergyLearningCompatibleStrategy,
         RenewableEnergyLearningSingleBidStrategyCongestion,
@@ -154,6 +157,9 @@ try:
     )
     bidding_strategies["storage_energy_learning_heuristic_dispatch_congestion"] = (
         StorageEnergyLearningHeuristicDispatchStrategyCongestion
+    )
+    bidding_strategies["storage_energy_learning_schedule_dispatch_congestion"] = (
+        StorageEnergyLearningScheduleDispatchStrategyCongestion
     )
     bidding_strategies["renewable_energy_learning_single_bid_congestion"] = (
         RenewableEnergyLearningSingleBidStrategyCongestion

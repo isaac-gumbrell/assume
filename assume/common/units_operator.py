@@ -386,6 +386,7 @@ class UnitsOperator(Role):
                 "generation_costs",
                 "total_costs",
                 "heat",
+                "schedule_deviation",
             ]
 
             for key in unit.outputs.keys():

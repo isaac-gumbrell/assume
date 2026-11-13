@@ -5,10 +5,12 @@
 import math
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from assume.common.base import LearningConfig
+from assume.common.fast_pandas import FastSeries
 from assume.common.forecaster import UnitForecaster
 
 try:
@@ -20,12 +22,17 @@ try:
         StorageEnergyLearningHeuristicDispatchStrategyCongestion,
         StorageEnergyLearningHeuristicStrategy,
         StorageEnergyLearningHeuristicStrategyCongestion,
+        StorageEnergyLearningScheduleDispatchStrategyCongestion,
         StorageEnergyLearningStrategy,
     )
 except ImportError:
     th = None
 
 from assume.common.market_objects import MarketConfig
+from assume.strategies import (
+    StorageEnergyFixedScheduleStrategy,
+    StorageEnergyHeuristicFlexableStrategy,
+)
 from assume.units import Storage
 
 
@@ -148,10 +155,241 @@ def test_storage_dispatch_heuristic_forwards_schedule_price_source(storage_unit)
 
 
 @pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "params, expected_hours",
+    [
+        ({}, 12),
+        ({"heuristic_foresight": "24h"}, 24),
+        ({"heuristic_foresight": "24h", "eom_foresight": "24h"}, 24),
+    ],
+)
+def test_storage_dispatch_heuristic_foresight_resolution(
+    storage_unit, params, expected_hours
+):
+    strategy = _dispatch_learning_strategy(storage_unit, **params)
+
+    assert strategy.heuristic_strategy.foresight == pd.Timedelta(hours=expected_hours)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "params, match",
+    [
+        ({"eom_foresight": "24h"}, "reads 'heuristic_foresight'"),
+        ({"heuristic_foresight": "24h", "eom_foresight": "12h"}, "Conflicting"),
+    ],
+)
+def test_storage_dispatch_heuristic_foresight_errors(storage_unit, params, match):
+    with pytest.raises(ValueError, match=match):
+        _dispatch_learning_strategy(storage_unit, **params)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize("soc", [0.0, 0.5, 1.0])
+def test_storage_srmc_and_dispatch_heuristics_choose_same_mode_and_volume(
+    mock_market_config, storage_unit, soc
+):
+    """Same unit, forecasts, SoC and time give the same mode and volume."""
+    params = {
+        "eom_foresight": "6h",
+        "heuristic_foresight": "6h",
+        "heuristic_schedule_price_source": "primary",
+    }
+    srmc_strategy = StorageEnergyHeuristicFlexableStrategy(**params)
+    dispatch_strategy = _dispatch_learning_strategy(storage_unit, **params)
+
+    index = pd.date_range("2023-07-01", periods=24, freq="h")
+    prices = [30, 40, 80, 90, 20, 10, 60, 70, 50, 50, 95, 15] * 2
+    storage_unit.forecaster = UnitForecaster(
+        index, market_prices={"test_market": prices}
+    )
+    storage_unit.outputs["soc"].at[index[0]] = soc
+
+    for start in index[:12]:
+        storage_unit.outputs["soc"].at[start] = soc
+        products = [(start, start + pd.Timedelta(hours=1), None)]
+        srmc_bids = srmc_strategy.calculate_bids(
+            storage_unit, mock_market_config, products
+        )
+        with patch.object(
+            dispatch_strategy,
+            "get_actions",
+            return_value=(th.tensor([-1.0]), th.tensor([0.0])),
+        ):
+            dispatch_bids = dispatch_strategy.calculate_bids(
+                storage_unit, mock_market_config, products
+            )
+
+        assert [bid["volume"] for bid in dispatch_bids] == pytest.approx(
+            [bid["volume"] for bid in srmc_bids]
+        )
+
+
+def _schedule_learning_strategy(storage_unit, **kwargs):
+    current_strategy = storage_unit.bidding_strategies["test_market"]
+    params = {
+        "learning_role": current_strategy.learning_role,
+        "unit_id": storage_unit.id,
+        "storage_bid_price_limit": 2_000,
+        "n_lines": 0,
+        "forecast_multiplier": 1.4,
+        "forecast_upper_bound_floor": 200,
+        "schedule_discharge_price": -10.0,
+        "schedule_charge_price": 10_000.0,
+    }
+    params.update(kwargs)
+    return StorageEnergyLearningScheduleDispatchStrategyCongestion(**params)
+
+
+def _set_schedule(storage_unit, schedule, prices=50.0):
+    index = pd.date_range("2023-07-01", periods=len(schedule), freq="h")
+    storage_unit.forecaster = UnitForecaster(
+        index, market_prices={"test_market": prices}
+    )
+    storage_unit.index = storage_unit.forecaster.index
+    storage_unit.outputs.clear()
+    storage_unit.outputs["soc"] = FastSeries(
+        index=storage_unit.index, value=storage_unit.initial_soc
+    )
+    storage_unit.forecaster.storage_schedule = FastSeries(
+        index=storage_unit.forecaster.index, value=np.asarray(schedule, float)
+    )
+    return index
+
+
+def _clear(storage_unit, strategy, mock_market_config, bids, accepted_volume):
+    bids[0]["accepted_volume"] = accepted_volume
+    bids[0]["accepted_price"] = 50.0
+    storage_unit.set_dispatch_plan(mock_market_config, bids)
+    start = bids[0]["start_time"]
+    storage_unit.execute_current_dispatch(start, start)
+    strategy.calculate_reward(storage_unit, mock_market_config, bids)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_keeps_shared_policy_dimensions(storage_unit):
+    strategy = _schedule_learning_strategy(storage_unit, n_lines=47, foresight=24)
+
+    assert strategy.obs_dim == 121
+    assert strategy.unique_obs_dim == 2
+    assert strategy.act_dim == 1
+    assert strategy.heuristic_strategy is None
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "params, match",
+    [
+        ({"schedule_discharge_price": None}, "schedule_discharge_price"),
+        ({"schedule_charge_price": 30_000.0}, "schedule_charge_price"),
+    ],
+)
+def test_schedule_dispatch_validates_prices(storage_unit, params, match):
+    with pytest.raises(ValueError, match=match):
+        _schedule_learning_strategy(storage_unit, **params)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_lowest_action_reproduces_fixed_schedule_bids(
+    mock_market_config, storage_unit
+):
+    schedule = [400.0, -500.0, 0.0, 200.0, 0.0]
+    index = _set_schedule(storage_unit, schedule)
+    learning = _schedule_learning_strategy(storage_unit)
+    fixed = StorageEnergyFixedScheduleStrategy(
+        schedule_discharge_price=-10.0, schedule_charge_price=10_000.0
+    )
+
+    for start, scheduled in zip(index, schedule):
+        products = [(start, start + pd.Timedelta(hours=1), None)]
+        fixed_bids = fixed.calculate_bids(storage_unit, mock_market_config, products)
+        with patch.object(
+            learning,
+            "get_actions",
+            return_value=(th.tensor([-1.0]), th.tensor([0.0])),
+        ):
+            bids = learning.calculate_bids(storage_unit, mock_market_config, products)
+
+        assert [(b["volume"], b["price"]) for b in bids] == pytest.approx(
+            [(b["volume"], b["price"]) for b in fixed_bids]
+        )
+        assert learning._rl_active_by_start[start] == (scheduled > 0)
+        if bids:
+            _clear(storage_unit, learning, mock_market_config, bids, scheduled)
+
+    assert storage_unit.outputs["schedule_deviation"].data == pytest.approx(0.0)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_markup_withholds_and_resyncs(
+    mock_market_config, storage_unit
+):
+    # initial SoC 0.5 of 1000 MWh; efficiencies 0.9
+    schedule = [360.0, -500.0, -500.0, 0.0]
+    index = _set_schedule(storage_unit, schedule, prices=100.0)
+    strategy = _schedule_learning_strategy(storage_unit)
+
+    products = [(index[0], index[1], None)]
+    with patch.object(
+        strategy, "get_actions", return_value=(th.tensor([1.0]), th.tensor([0.0]))
+    ):
+        bids = strategy.calculate_bids(storage_unit, mock_market_config, products)
+    assert bids[0]["volume"] == pytest.approx(360.0)
+    assert bids[0]["price"] == pytest.approx(200.0)  # max(100 * 1.4, floor 200)
+    assert strategy._rl_active_by_start[index[0]]
+    _clear(storage_unit, strategy, mock_market_config, bids, 0.0)  # withheld
+
+    soc_after_withholding = storage_unit.outputs["soc"].at[index[1]]
+    assert soc_after_withholding == pytest.approx(0.5)
+
+    # The first charge fills the battery, so the second scheduled charge is cut.
+    charged = []
+    for start in index[1:3]:
+        products = [(start, start + pd.Timedelta(hours=1), None)]
+        bids = strategy.calculate_bids(storage_unit, mock_market_config, products)
+        assert not strategy._rl_active_by_start[start]
+        assert bids[0]["price"] == 10_000.0
+        charged.append(bids[0]["volume"])
+        _clear(storage_unit, strategy, mock_market_config, bids, bids[0]["volume"])
+
+    assert charged[0] == pytest.approx(-500.0)
+    assert charged[1] == pytest.approx(-(1 - 0.95) * 1000 / 0.9)
+    assert storage_unit.outputs["soc"].at[index[3]] == pytest.approx(1.0)
+    deviation = storage_unit.outputs["schedule_deviation"]
+    assert deviation.at[index[0]] == pytest.approx(0.0)
+    assert deviation.at[index[2]] == pytest.approx(-500.0 - charged[1])
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_idle_step_is_masked(mock_market_config, storage_unit):
+    index = _set_schedule(storage_unit, [0.0, 0.0, 0.0, 0.0])
+    strategy = _schedule_learning_strategy(storage_unit)
+
+    bids = strategy.calculate_bids(
+        storage_unit, mock_market_config, [(index[0], index[1], None)]
+    )
+
+    assert bids == []
+    assert strategy.learning_role.all_active[index[0]][storage_unit.id] == [0.0]
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_requires_schedule(mock_market_config, storage_unit):
+    index = pd.date_range("2023-07-01", periods=2, freq="h")
+    strategy = _schedule_learning_strategy(storage_unit)
+    with pytest.raises(ValueError, match="storage_schedule_test_storage"):
+        strategy.calculate_bids(
+            storage_unit, mock_market_config, [(index[0], index[1], None)]
+        )
+
+
+@pytest.mark.require_learning
 def test_storage_dispatch_policy_shares_matd3_dimensions_with_srmc_congestion(
     storage_unit,
 ):
-    storage_strategy = _dispatch_learning_strategy(storage_unit, n_lines=47, foresight=24)
+    storage_strategy = _dispatch_learning_strategy(
+        storage_unit, n_lines=47, foresight=24
+    )
     SRMCEnergyLearningStrategyCongestion(
         learning_role=storage_strategy.learning_role,
         unit_id="test_generator",
@@ -198,7 +436,9 @@ def test_storage_dispatch_policy_uses_actor_only_for_discharge(
         market_prices={"test_market": [40.0, 50.0, 50.0, 50.0]},
     )
     with patch.object(strategy, "get_actions") as get_actions:
-        bids = strategy.calculate_bids(storage_unit, mock_market_config, charge_products)
+        bids = strategy.calculate_bids(
+            storage_unit, mock_market_config, charge_products
+        )
 
     assert get_actions.call_count == 0
     assert bids[0]["volume"] < 0
@@ -238,9 +478,7 @@ def test_storage_dispatch_policy_records_complete_no_bid_transition(
     strategy = _dispatch_learning_strategy(storage_unit)
     storage_unit.forecaster.is_foreign = is_foreign
 
-    with patch.object(
-        strategy.heuristic_strategy, "calculate_bids", return_value=[]
-    ):
+    with patch.object(strategy.heuristic_strategy, "calculate_bids", return_value=[]):
         bids = strategy.calculate_bids(storage_unit, mock_market_config, product_tuples)
 
     learning_role = strategy.learning_role

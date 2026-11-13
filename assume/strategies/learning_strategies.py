@@ -23,7 +23,11 @@ from assume.common.market_objects import MarketConfig, Orderbook, Product
 from assume.common.utils import min_max_scale
 from assume.reinforcement_learning.algorithms import actor_architecture_aliases
 from assume.reinforcement_learning.learning_utils import NormalActionNoise
-from assume.strategies.flexable_storage import StorageEnergyHeuristicFlexableStrategy
+from assume.strategies.flexable_storage import (
+    StorageEnergyHeuristicFlexableStrategy,
+    resolve_storage_heuristic_foresight,
+)
+from assume.strategies.scheduled_storage import StorageScheduleMixin
 
 logger = logging.getLogger(__name__)
 
@@ -1424,13 +1428,29 @@ class StorageEnergyLearningHeuristicStrategy(StorageEnergyLearningStrategy):
     def __init__(
         self,
         *args,
-        heuristic_foresight: str = "12h",
+        heuristic_foresight: str | None = None,
         heuristic_schedule_price_source: str = "primary",
         **kwargs,
     ):
+        eom_foresight = kwargs.get("eom_foresight")
         super().__init__(*args, **kwargs)
-        self.heuristic_strategy = StorageEnergyHeuristicFlexableStrategy(
-            eom_foresight=heuristic_foresight,
+        self.heuristic_strategy = self._create_heuristic_strategy(
+            heuristic_foresight, eom_foresight, heuristic_schedule_price_source
+        )
+
+    def _create_heuristic_strategy(
+        self,
+        heuristic_foresight: str | None,
+        eom_foresight: str | None,
+        heuristic_schedule_price_source: str,
+    ) -> StorageEnergyHeuristicFlexableStrategy | None:
+        foresight = resolve_storage_heuristic_foresight(
+            eom_foresight=eom_foresight,
+            heuristic_foresight=heuristic_foresight,
+            read_key="heuristic_foresight",
+        )
+        return StorageEnergyHeuristicFlexableStrategy(
+            eom_foresight=foresight,
             heuristic_schedule_price_source=heuristic_schedule_price_source,
         )
 
@@ -2338,9 +2358,7 @@ class StorageEnergyLearningHeuristicDispatchStrategyCongestion(
                 "exactly one product per market opening."
             )
 
-        bids = self.heuristic_strategy.calculate_bids(
-            unit, market_config, product_tuples, **kwargs
-        )
+        bids = self._mode_and_volume_bids(unit, market_config, product_tuples, **kwargs)
         if not bids:
             # A storage heuristic can abstain for a native unit as well as for
             # a foreign staggered unit. Neither outcome gets market feedback,
@@ -2407,6 +2425,131 @@ class StorageEnergyLearningHeuristicDispatchStrategyCongestion(
             self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
 
         return bids
+
+    def _mode_and_volume_bids(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_config: MarketConfig,
+        product_tuples: list[Product],
+        **kwargs,
+    ) -> Orderbook:
+        """Return the bid fixing mode and volume; its price is replaced afterwards."""
+        return self.heuristic_strategy.calculate_bids(
+            unit, market_config, product_tuples, **kwargs
+        )
+
+
+class StorageEnergyLearningScheduleDispatchStrategyCongestion(
+    StorageScheduleMixin, StorageEnergyLearningHeuristicDispatchStrategyCongestion
+):
+    """Storage following an exogenous schedule, with an RL discharge markup.
+
+    Mode and volume come from the unit's ``storage_schedule_{unit_id}`` column in
+    forecasts_df instead of the heuristic. The schedule acts as a cap: discharge is
+    ``min(schedule, feasible)`` and charging is ``min(|schedule|, headroom)``. When a
+    markup withholds energy, the SoC stays above the schedule and later charging is
+    reduced until the SoC meets the schedule again. Shortfalls against the schedule
+    are recorded in the unit output ``schedule_deviation`` (MW, scheduled minus bid).
+
+    Discharge prices map the action from ``schedule_discharge_price`` (action -1,
+    identical to :class:`~assume.strategies.scheduled_storage.StorageEnergyFixedScheduleStrategy`)
+    up to ``max(forecast * forecast_multiplier, forecast_upper_bound_floor)``.
+    Charging bids ``schedule_charge_price`` and stays masked from learning. Action
+    dimension, observations and replay layout are unchanged.
+
+    Args:
+        schedule_discharge_price (float): Lower bound of the discharge price (required).
+        schedule_charge_price (float): Charge bid price (required).
+        schedule_tolerance (float): Absolute tolerance in MW. Defaults to 0.01.
+        **kwargs: Forwarded to :class:`StorageEnergyLearningHeuristicDispatchStrategyCongestion`.
+    """
+
+    def __init__(
+        self,
+        *args,
+        schedule_discharge_price: float | None = None,
+        schedule_charge_price: float | None = None,
+        schedule_tolerance: float = 0.01,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._init_schedule_params(
+            schedule_discharge_price, schedule_charge_price, schedule_tolerance
+        )
+        if self.schedule_discharge_price > self.max_bid_price:
+            raise ValueError(
+                "schedule_discharge_price must not exceed max_bid_price, got "
+                f"{self.schedule_discharge_price} > {self.max_bid_price}."
+            )
+        if not 0 <= self.schedule_charge_price <= self.max_bid_price:
+            raise ValueError(
+                "schedule_charge_price must be between 0 and max_bid_price, got "
+                f"{self.schedule_charge_price}."
+            )
+
+    def _create_heuristic_strategy(
+        self,
+        heuristic_foresight: str | None,
+        eom_foresight: str | None,
+        heuristic_schedule_price_source: str,
+    ) -> None:
+        return None
+
+    def _mode_and_volume_bids(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_config: MarketConfig,
+        product_tuples: list[Product],
+        **kwargs,
+    ) -> Orderbook:
+        start, end = product_tuples[0][0], product_tuples[0][1]
+        scheduled = self._scheduled_power(unit, start)
+        volume = 0.0
+        if scheduled != 0:
+            max_discharge, max_charge = self._feasible_power_limits(
+                unit,
+                start,
+                end,
+                unit.outputs["soc"].at[start],
+                unit.get_output_before(start),
+            )
+            volume = (
+                min(scheduled, max_discharge)
+                if scheduled > 0
+                else max(scheduled, max_charge)
+            )
+            if abs(volume) <= self.schedule_tolerance:
+                volume = 0.0
+
+        unit.outputs["schedule_deviation"].at[start] = scheduled - volume
+
+        if volume == 0:
+            return []
+        return [self._schedule_bid(unit, start, end, volume)]
+
+    def _dispatch_price_bounds(
+        self,
+        unit: SupportsMinMaxCharge,
+        market_id: str,
+        start: datetime,
+        volume: float,
+    ) -> tuple[float, float]:
+        forecast_price = float(unit.forecaster.price[market_id].at[start])
+        lower_bound = self.schedule_discharge_price
+        upper_bound = min(
+            max(
+                forecast_price * self.forecast_multiplier,
+                self.forecast_upper_bound_floor,
+                lower_bound,
+            ),
+            self.max_bid_price,
+        )
+        return lower_bound, upper_bound
+
+    def _charge_bid_price(
+        self, unit: SupportsMinMaxCharge, market_id: str, start: datetime
+    ) -> float:
+        return self.schedule_charge_price
 
 
 class RenewableEnergyLearningSingleBidStrategyCongestion(

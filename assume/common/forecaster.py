@@ -12,6 +12,7 @@ import pandas as pd
 from assume.common.exceptions import ValidationError
 from assume.common.fast_pandas import FastIndex, FastSeries
 from assume.common.market_objects import MarketConfig
+from assume.common.storage_schedule import load_storage_schedule
 
 if TYPE_CHECKING:
     from assume.common.base import BaseUnit  # , BaseForecaster
@@ -242,6 +243,9 @@ class UnitForecaster:
         )
         self.preprocess_information = {}
         self.congestion_signal_lines: dict[str, FastSeries] = {}
+        # Exogenous storage schedule from ``storage_schedule_{unit_id}`` columns of
+        # forecasts_df (see assume.common.storage_schedule); None when not given.
+        self.storage_schedule: FastSeries | None = None
         # True when this unit belongs to the *other* scenario in staggered
         # (paired-scenario) training. Foreign units are registered as part of the
         # shared agent superset but forced inactive (availability=0) so they never
@@ -395,6 +399,9 @@ class UnitForecaster:
         self.preprocess(units, market_configs, forecast_df, initializing_unit)
         self._price_forecasts_by_source = {}
         self._price_forecast_context = (units, market_configs, initializing_unit)
+        self.storage_schedule = load_storage_schedule(
+            forecast_df, units, initializing_unit, self.index
+        )
 
         # 1. Get price forecast
         price_forecast_algorithm_name = self.forecast_algorithms.get(
