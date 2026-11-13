@@ -57,6 +57,58 @@ logging.getLogger("mango").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+class _AgentFailureHandler(logging.Handler):
+    """Keep the first exception that stopped a mango agent's message loop.
+
+    mango catches and logs exceptions raised while an agent handles a message, and
+    the agent then stops reading its inbox. The exception is kept here so the world
+    can re-raise it instead of waiting forever for that inbox.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.exception: BaseException | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.exception is None and record.exc_info and record.exc_info[1]:
+            self.exception = record.exc_info[1]
+
+
+_agent_failure_handler = _AgentFailureHandler()
+logging.getLogger("mango.agent.core").addHandler(_agent_failure_handler)
+
+
+async def _await_unless_agent_failed(container: Container, awaitable):
+    """Await ``awaitable`` but raise as soon as an agent's message loop stops.
+
+    A stopped message loop never empties its inbox, so the termination detection
+    of mango would otherwise wait forever.
+    """
+    task = asyncio.ensure_future(awaitable)
+    inbox_tasks = {
+        agent._check_inbox_task
+        for agent in container._agents.values()
+        if getattr(agent, "_check_inbox_task", None) is not None
+        and not agent._check_inbox_task.done()
+    }
+    while not task.done():
+        done, _ = await asyncio.wait(
+            {task, *inbox_tasks}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for inbox_task in done & inbox_tasks:
+            inbox_tasks.discard(inbox_task)
+            if inbox_task.cancelled():
+                continue
+            task.cancel()
+            if _agent_failure_handler.exception is not None:
+                raise _agent_failure_handler.exception
+            raise RuntimeError(
+                "A simulation agent stopped handling messages after an error; see "
+                "the log for details."
+            )
+    return task.result()
+
+
 class _WorldContainerActivation:
     """Async context manager helper for :meth:`World.activate_container`.
 
@@ -72,6 +124,7 @@ class _WorldContainerActivation:
 
     async def __aenter__(self) -> Container:
         logger.debug("activating container")
+        _agent_failure_handler.exception = None
         self._cm = activate(self._world.container)
         c = await self._cm.__aenter__()
         await tasks_complete_or_sleeping(c)
@@ -827,7 +880,9 @@ class World:
             return None
         delta = next_activity - self.clock.time
         self.clock.set_time(next_activity)
-        await tasks_complete_or_sleeping(container)
+        await _await_unless_agent_failed(
+            container, tasks_complete_or_sleeping(container)
+        )
         return delta
 
     async def async_run(self, start_ts: datetime, end_ts: datetime):
@@ -928,7 +983,9 @@ class World:
 
         # tasks which fire at exactly end_ts need to be awaited before shutdown
         await asyncio.sleep(0)
-        await tasks_complete_or_sleeping(container, except_sources=[])
+        await _await_unless_agent_failed(
+            container, tasks_complete_or_sleeping(container, except_sources=[])
+        )
 
     def run(self):
         """
