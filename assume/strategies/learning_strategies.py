@@ -403,9 +403,11 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
       unit's operational capacity and production costs, helping the agent determine the optimal bid.
 
     Actions are formulated as two values, representing bid prices for both the inflexible and flexible
-    components of the unit's capacity. Actions are scaled from a range of [-1, 1]
-    to real bid prices in the `calculate_bids` method, where they translate into specific bid volumes
-    for the inflexible (P_min) and flexible (P_max - P_min) components.
+    components of the unit's capacity. In the `calculate_bids` method, actions are remapped from
+    ``[-1, 1]`` to the SRMC-bounded range
+    ``[SRMC, min(max(SRMC * srmc_multiplier, SRMC + srmc_upper_bound_floor), max_bid_price)]``,
+    so the agent learns a markup above its short-run marginal cost. The lower action prices the
+    inflexible (P_min) component and the higher action prices the flexible (P_max - P_min) component.
 
     Rewards are based on profit from transactions, minus operational and opportunity costs. Key components include:
 
@@ -445,10 +447,25 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
     Args
     ----
     *args : Variable length argument list.
+    srmc_multiplier : float, optional
+        Factor applied to SRMC to obtain the upper bid bound (before capping at
+        ``max_bid_price``). Must be finite and >= 1. Defaults to 1.4.
+    srmc_upper_bound_floor : float, optional
+        Minimum markup above SRMC of the upper bid bound. Must be finite and
+        non-negative. Defaults to 200.
     **kwargs : Arbitrary keyword arguments.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        srmc_multiplier: float = 1.4,
+        srmc_upper_bound_floor: float = 200.0,
+        **kwargs,
+    ):
+        validate_srmc_action_bounds(srmc_multiplier, srmc_upper_bound_floor)
+        self.srmc_multiplier = srmc_multiplier
+        self.srmc_upper_bound_floor = srmc_upper_bound_floor
         # 'foresight' represents the number of time steps into the future that we will consider
         # when constructing the observations.
         foresight = kwargs.pop("foresight", 12)
@@ -496,8 +513,8 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         This method structures bids in two parts:
         - **Inflexible Bid** (P_min): A bid for the minimum operational capacity.
         - **Flexible Bid** (P_max - P_min): A bid for the flexible capacity available after P_min.
-        The actions are scaled to reflect real bid prices and volumes, which are then converted into
-        orderbook entries.
+        The actions are remapped linearly from ``[-1, 1]`` onto the SRMC-bounded price range
+        and then converted into orderbook entries.
         """
 
         bid_quantity_inflex, bid_price_inflex = 0, 0
@@ -509,6 +526,13 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         min_power, max_power = unit.calculate_min_max_power(start, end)
         min_power = min_power[0]
         max_power = max_power[0]
+
+        srmc, upper_bound = calculate_srmc_action_bounds(
+            unit.calculate_marginal_cost(start, max_power),
+            self.max_bid_price,
+            self.srmc_multiplier,
+            self.srmc_upper_bound_floor,
+        )
 
         # =============================================================================
         # 1. Get the Observations, which are the basis of the action decision
@@ -528,9 +552,8 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
         # =============================================================================
         # 3. Transform Actions into bids
         # =============================================================================
-        # actions are in the range [-1,1], we need to transform them into actual bids
-        # we can use our domain knowledge to guide the bid formulation
-        bid_prices = actions * self.max_bid_price
+        # Remap from [-1, 1] to the SRMC-bounded interval so the agent learns a markup
+        bid_prices = srmc + ((actions + 1) / 2) * (upper_bound - srmc)
 
         # 3.1 formulate the bids for Pmin
         # Pmin, the minimum run capacity is the inflexible part of the bid, which should always be accepted
@@ -566,39 +589,6 @@ class EnergyLearningStrategy(TorchLearningStrategy, MinMaxStrategy):
             self.learning_role.add_actions_to_cache(self.unit_id, start, actions, noise)
 
         return bids
-
-    def get_actions(self, next_observation):
-        """
-        Compute actions based on the current observation.
-
-        Args
-        ----
-        next_observation : torch.Tensor
-            The current observation, where the last element is assumed to be the marginal cost.
-
-        Returns
-        -------
-        tuple of torch.Tensor
-            A tuple containing: Actions to be taken (with or without noise). The noise component (if any), useful for diagnostics.
-
-        Notes
-        -----
-        During learning, exploratory noise is applied and already part of the curr_action unless in evaluation mode. In initial exploration mode, actions are sampled around the marginal cost to explore its vicinity. We assume the final element of `next_observation` is the marginal cost.
-        """
-
-        # Get the base action and associated noise from the parent implementation
-        curr_action, noise = super().get_actions(next_observation)
-
-        if self.learning_mode and not self.evaluation_mode:
-            if self.collect_initial_experience_mode:
-                # Assumes last dimension of the observation corresponds to marginal cost
-                marginal_cost = next_observation[
-                    -1
-                ].detach()  # ensure no gradients flow through
-                # Add marginal cost to the action directly for initial random exploration
-                curr_action += marginal_cost
-
-        return curr_action, noise
 
     def get_individual_observations(
         self, unit: SupportsMinMax, start: datetime, end: datetime
@@ -892,6 +882,40 @@ class EnergyLearningSingleBidStrategy(EnergyLearningStrategy, MinMaxStrategy):
 
         return bids
 
+    def get_actions(self, next_observation):
+        """
+        Compute actions based on the current observation.
+
+        Args
+        ----
+        next_observation : torch.Tensor
+            The current observation, where the last element is assumed to be the marginal cost.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            A tuple containing: Actions to be taken (with or without noise). The noise component (if any), useful for diagnostics.
+
+        Notes
+        -----
+        During learning, exploratory noise is applied and already part of the curr_action unless in evaluation mode. In initial exploration mode, actions are sampled around the marginal cost to explore its vicinity. We assume the final element of `next_observation` is the marginal cost.
+        This bias only applies to the absolute ``action * max_bid_price`` mapping used here.
+        """
+
+        # Get the base action and associated noise from the parent implementation
+        curr_action, noise = super().get_actions(next_observation)
+
+        if self.learning_mode and not self.evaluation_mode:
+            if self.collect_initial_experience_mode:
+                # Assumes last dimension of the observation corresponds to marginal cost
+                marginal_cost = next_observation[
+                    -1
+                ].detach()  # ensure no gradients flow through
+                # Add marginal cost to the action directly for initial random exploration
+                curr_action += marginal_cost
+
+        return curr_action, noise
+
 
 class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
     """
@@ -948,16 +972,18 @@ class SRMCEnergyLearningStrategy(EnergyLearningSingleBidStrategy):
         srmc_upper_bound_floor: float,
         **kwargs,
     ):
-        validate_srmc_action_bounds(srmc_multiplier, srmc_upper_bound_floor)
-        self.srmc_multiplier = srmc_multiplier
-        self.srmc_upper_bound_floor = srmc_upper_bound_floor
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            srmc_multiplier=srmc_multiplier,
+            srmc_upper_bound_floor=srmc_upper_bound_floor,
+            **kwargs,
+        )
 
     def get_actions(self, next_observation):
         """
         Determine actions based on the current observation.
 
-        Overrides ``EnergyLearningStrategy.get_actions`` to remove the marginal-cost
+        Overrides ``EnergyLearningSingleBidStrategy.get_actions`` to remove the marginal-cost
         exploration bias. That bias is only appropriate when the action maps linearly
         to an absolute price via ``action * max_bid_price``. Here the action is remapped
         to an SRMC-bounded range in :meth:`calculate_bids`, so SRMC is already baked into
@@ -1824,9 +1850,6 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         srmc_upper_bound_floor: float,
         **kwargs,
     ):
-        validate_srmc_action_bounds(srmc_multiplier, srmc_upper_bound_floor)
-        self.srmc_multiplier = srmc_multiplier
-        self.srmc_upper_bound_floor = srmc_upper_bound_floor
         foresight = kwargs.pop("foresight", 24)
         act_dim = kwargs.pop("act_dim", 1)
         # Default unique_obs_dim=2 so obs_dim matches storage/generator strategies.
@@ -1838,6 +1861,8 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
             foresight=foresight,
             act_dim=act_dim,
             unique_obs_dim=unique_obs_dim,
+            srmc_multiplier=srmc_multiplier,
+            srmc_upper_bound_floor=srmc_upper_bound_floor,
             *args,
             **kwargs,
         )
@@ -1847,6 +1872,7 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
     ):
         """
         Return unit-specific observations for renewable units (compatible variant).
+
 
         Only two observations are returned so that ``unique_obs_dim`` equals 2,
         matching the storage and generator learning strategies.
@@ -1877,7 +1903,7 @@ class RenewableEnergyLearningCompatibleStrategy(EnergyLearningSingleBidStrategy)
         """
         Determines actions based on the current observation.
 
-        Overrides EnergyLearningStrategy.get_actions to remove the marginal cost
+        Overrides EnergyLearningSingleBidStrategy.get_actions to remove the marginal cost
         exploration bias, which is inappropriate for renewables where marginal cost
         has been removed from the observation space. Falls back to pure noise-driven
         exploration during initial experience collection.

@@ -180,7 +180,7 @@ def test_learning_strategies_parametrized(
 def test_initial_experience_noise_not_contaminated_by_marginal_cost():
     """Regression: the exploration-noise diagnostic must stay pure.
 
-    During initial-experience collection ``EnergyLearningStrategy.get_actions``
+    During initial-experience collection ``EnergyLearningSingleBidStrategy.get_actions``
     biases the action towards the marginal cost (``curr_action += marginal_cost``).
     The base class must return the action as a *distinct* tensor from ``noise`` so
     this in-place bias does not leak into the recorded noise. Previously the two
@@ -199,7 +199,7 @@ def test_initial_experience_noise_not_contaminated_by_marginal_cost():
         ),
     }
     learning_role = Learning(config["learning_config"], start, end)
-    strategy = EnergyLearningStrategy(learning_role=learning_role, **config)
+    strategy = EnergyLearningSingleBidStrategy(learning_role=learning_role, **config)
     strategy.collect_initial_experience_mode = True
 
     marginal_cost = 0.3
@@ -216,6 +216,64 @@ def test_initial_experience_noise_not_contaminated_by_marginal_cost():
         th.full_like(noise, marginal_cost),
         atol=1e-6,
     )
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize("strategy_class", [EnergyLearningStrategy])
+def test_energy_learning_strategy_srmc_bid_remap(
+    mock_market_config, power_plant, strategy_class
+):
+    """Both two-bid actions are remapped onto ``[SRMC, upper bound]``."""
+    import torch as th
+
+    product_index = pd.date_range("2023-07-01", periods=1, freq="h")
+    mc = mock_market_config
+    mc.product_type = "energy_eom"
+    product_tuples = [(s, s + pd.Timedelta(hours=1), None) for s in product_index]
+
+    learning_role, config = _make_srmc_learning_role()
+    strategy = strategy_class(learning_role=learning_role, **config)
+
+    srmc = 25.0
+    upper_bound = srmc + 200.0
+    with (
+        patch.object(
+            strategy_class,
+            "get_actions",
+            return_value=(th.tensor([1.0, -1.0]), th.tensor([0.0, 0.0])),
+        ),
+        patch.object(PowerPlant, "calculate_marginal_cost", return_value=srmc),
+    ):
+        bids = strategy.calculate_bids(power_plant, mc, product_tuples=product_tuples)
+
+    assert [bid["volume"] for bid in bids] == [200, 800]
+    assert bids[0]["price"] == pytest.approx(srmc)
+    assert bids[1]["price"] == pytest.approx(upper_bound)
+
+
+@pytest.mark.require_learning
+def test_energy_learning_strategy_get_actions_has_no_marginal_cost_bias():
+    """SRMC is baked into the two-bid remap, so exploration must stay unbiased."""
+    import torch as th
+
+    config = {
+        "unit_id": "test_pp",
+        "learning_config": LearningConfig(
+            algorithm="matd3",
+            learning_mode=True,
+            training_episodes=3,
+        ),
+    }
+    learning_role = Learning(config["learning_config"], start, end)
+    strategy = EnergyLearningStrategy(learning_role=learning_role, **config)
+    strategy.collect_initial_experience_mode = True
+
+    observation = th.zeros(strategy.obs_dim, dtype=strategy.float_type)
+    observation[-1] = 0.3
+
+    action, noise = strategy.get_actions(observation)
+
+    assert th.allclose(action, noise, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
