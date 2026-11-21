@@ -1342,6 +1342,8 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         Notes
         -----
         Rewards are based on profit and include fixed costs for charging and discharging.
+        Subclasses can subtract an opportunity-cost penalty via :meth:`_regret`, which
+        is also logged as ``regret``; the base class returns 0.
         """
         product_type = marketconfig.product_type
         reward = 0
@@ -1379,6 +1381,9 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
 
         current_soc = unit.outputs["soc"].at[start]
         next_soc = unit.outputs["soc"].at[next_time]
+
+        # Read the stored-energy cost at ``start`` before it is propagated below.
+        regret = self._regret(unit, marketconfig, orderbook, start, duration_hours)
 
         # Calculate and clip the energy cost for the start time
         # cost_stored_energy = average volume-weighted procurement costs of the currently stored energy
@@ -1420,7 +1425,7 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         scaling_factor = 1 / (self.max_bid_price * unit.max_power_discharge)
 
         reward += scaling_factor * (
-            profit + self.soc_value_weight * inventory_value_change
+            profit + self.soc_value_weight * inventory_value_change - regret
         )
 
         # Store results in unit outputs
@@ -1437,8 +1442,19 @@ class StorageEnergyLearningStrategy(TorchLearningStrategy, MinMaxChargeStrategy)
         # write rl-rewards to buffer
         if self.learning_mode:
             self.learning_role.add_reward_to_cache(
-                unit.id, start, reward, 0, profit, active
+                unit.id, start, reward, regret, profit, active
             )
+
+    def _regret(
+        self,
+        unit: SupportsMinMaxCharge,
+        marketconfig: MarketConfig,
+        orderbook: Orderbook,
+        start: datetime,
+        duration_hours: float,
+    ) -> float:
+        """Return the opportunity-cost penalty subtracted from the reward (unscaled)."""
+        return 0.0
 
 
 class StorageEnergyLearningHeuristicStrategy(StorageEnergyLearningStrategy):
@@ -2483,10 +2499,28 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
     Charging bids ``schedule_charge_price`` and stays masked from learning. Action
     dimension, observations and replay layout are unchanged.
 
+    Missed scheduled discharge is penalised with a regret term, mirroring the
+    generator strategies::
+
+        missed = max(scheduled - accepted, 0)
+        margin = max(clearing_price - cost_stored_energy[start], 0)
+        scale = regret_scale_dispatched if accepted > schedule_tolerance else regret_scale_idle
+        regret = regret_weight * scale * margin * missed * duration_hours
+
+    The baseline is the exogenous schedule, not the bid volume, so withholding
+    cannot shrink its own penalty. The clearing price comes from
+    :func:`resolve_clearing_price`, which falls back to the price forecast when
+    the order was rejected (rejected orders carry ``accepted_price = 0``). Charging
+    periods, periods without scheduled discharge and foreign units have no regret.
+
     Args:
         schedule_discharge_price (float): Lower bound of the discharge price (required).
         schedule_charge_price (float): Charge bid price (required).
         schedule_tolerance (float): Absolute tolerance in MW. Defaults to 0.01.
+        regret_weight (float): Overall regret multiplier (required, >= 0).
+        regret_scale_dispatched (float): Regret scale when part of the discharge
+            cleared (required, >= 0).
+        regret_scale_idle (float): Regret scale when nothing cleared (required, >= 0).
         **kwargs: Forwarded to :class:`StorageEnergyLearningHeuristicDispatchStrategyCongestion`.
     """
 
@@ -2496,12 +2530,34 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
         schedule_discharge_price: float | None = None,
         schedule_charge_price: float | None = None,
         schedule_tolerance: float = 0.01,
+        regret_weight: float | None = None,
+        regret_scale_dispatched: float | None = None,
+        regret_scale_idle: float | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._init_schedule_params(
             schedule_discharge_price, schedule_charge_price, schedule_tolerance
         )
+        for name, value in (
+            ("regret_weight", regret_weight),
+            ("regret_scale_dispatched", regret_scale_dispatched),
+            ("regret_scale_idle", regret_scale_idle),
+        ):
+            if value is None:
+                raise ValueError(
+                    f"{type(self).__name__} requires '{name}' in "
+                    "bidding_strategy_params."
+                )
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a number, got {value!r}.") from None
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"{name} must be a finite non-negative number, got {value}."
+                )
+            setattr(self, name, value)
         if self.schedule_discharge_price > self.max_bid_price:
             raise ValueError(
                 "schedule_discharge_price must not exceed max_bid_price, got "
@@ -2576,6 +2632,34 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
         self, unit: SupportsMinMaxCharge, market_id: str, start: datetime
     ) -> float:
         return self.schedule_charge_price
+
+    def _regret(
+        self,
+        unit: SupportsMinMaxCharge,
+        marketconfig: MarketConfig,
+        orderbook: Orderbook,
+        start: datetime,
+        duration_hours: float,
+    ) -> float:
+        if unit.forecaster.is_foreign:
+            return 0.0
+        scheduled = self._scheduled_power(unit, start)
+        if scheduled <= 0:
+            return 0.0
+
+        accepted = float(orderbook[0].get("accepted_volume", 0))
+        missed = max(scheduled - accepted, 0.0)
+        if missed == 0:
+            return 0.0
+
+        price = resolve_clearing_price(unit, marketconfig.market_id, orderbook, start)
+        margin = max(price - float(unit.outputs["cost_stored_energy"].at[start]), 0.0)
+        scale = (
+            self.regret_scale_dispatched
+            if accepted > self.schedule_tolerance
+            else self.regret_scale_idle
+        )
+        return self.regret_weight * scale * margin * missed * duration_hours
 
 
 class RenewableEnergyLearningSingleBidStrategyCongestion(

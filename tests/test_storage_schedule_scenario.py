@@ -282,7 +282,14 @@ def test_schedule_dispatch_learning_smoke(raw_run):
     write_scenario(
         inputs / "learning",
         "storage_energy_learning_schedule_dispatch_congestion",
-        {**SCHEDULE_PRICES, "n_lines": 1, "foresight": 4},
+        {
+            **SCHEDULE_PRICES,
+            "n_lines": 1,
+            "foresight": 4,
+            "regret_weight": 1.0,
+            "regret_scale_dispatched": 0.1,
+            "regret_scale_idle": 0.5,
+        },
         forecasts=schedule,
         learning_config={
             "learning_mode": True,

@@ -236,6 +236,9 @@ def _schedule_learning_strategy(storage_unit, **kwargs):
         "forecast_upper_bound_floor": 200,
         "schedule_discharge_price": -10.0,
         "schedule_charge_price": 10_000.0,
+        "regret_weight": 1.0,
+        "regret_scale_dispatched": 0.1,
+        "regret_scale_idle": 0.5,
     }
     params.update(kwargs)
     return StorageEnergyLearningScheduleDispatchStrategyCongestion(**params)
@@ -381,6 +384,200 @@ def test_schedule_dispatch_requires_schedule(mock_market_config, storage_unit):
         strategy.calculate_bids(
             storage_unit, mock_market_config, [(index[0], index[1], None)]
         )
+
+
+def _regret_step(
+    storage_unit,
+    mock_market_config,
+    scheduled,
+    accepted,
+    accepted_price=0.0,
+    forecast=100.0,
+    stored_cost=40.0,
+    soc=0.5,
+    **kwargs,
+):
+    """Bid and clear one scheduled step; return (strategy, start, bid, reward, regret, active)."""
+    index = _set_schedule(storage_unit, [scheduled, 0.0, 0.0], prices=forecast)
+    storage_unit.outputs["soc"].at[index[0]] = soc
+    storage_unit.outputs["cost_stored_energy"].at[index[0]] = stored_cost
+    strategy = _schedule_learning_strategy(storage_unit, **kwargs)
+    products = [(index[0], index[1], None)]
+    with patch.object(
+        strategy, "get_actions", return_value=(th.tensor([1.0]), th.tensor([0.0]))
+    ):
+        bids = strategy.calculate_bids(storage_unit, mock_market_config, products)
+    accepted = bids[0]["volume"] if accepted == "all" else accepted
+    bids[0]["accepted_volume"] = accepted
+    bids[0]["accepted_price"] = accepted_price
+    storage_unit.set_dispatch_plan(mock_market_config, bids)
+    storage_unit.execute_current_dispatch(index[0], index[0])
+    strategy.calculate_reward(storage_unit, mock_market_config, bids)
+
+    role = strategy.learning_role
+    unit_id = storage_unit.id
+    return (
+        strategy,
+        index[0],
+        bids[0],
+        role.all_rewards[index[0]][unit_id][-1],
+        role.all_regrets[index[0]][unit_id][-1],
+        role.all_active[index[0]][unit_id][-1],
+    )
+
+
+def _reward_scale(strategy, storage_unit):
+    return 1 / (strategy.max_bid_price * storage_unit.max_power_discharge)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_unaccepted_discharge(
+    mock_market_config, storage_unit
+):
+    strategy, _, _, reward, regret, active = _regret_step(
+        storage_unit, mock_market_config, scheduled=300.0, accepted=0.0
+    )
+    # rejected order: price falls back to the forecast (100), margin 100 - 40
+    assert regret == pytest.approx(0.5 * 60.0 * 300.0 * 1.0)
+    assert reward == pytest.approx(-regret * _reward_scale(strategy, storage_unit))
+    assert active == 1.0
+
+    *_, reward_without, regret_without, _ = _regret_step(
+        storage_unit, mock_market_config, scheduled=300.0, accepted=0.0, regret_weight=0
+    )
+    assert regret_without == 0.0
+    assert reward < reward_without
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_fully_accepted(mock_market_config, storage_unit):
+    *_, regret, active = _regret_step(
+        storage_unit,
+        mock_market_config,
+        scheduled=300.0,
+        accepted="all",
+        accepted_price=100.0,
+    )
+    assert regret == 0.0
+    assert active == 1.0
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_partial_uses_dispatched_scale(
+    mock_market_config, storage_unit
+):
+    *_, regret, _ = _regret_step(
+        storage_unit,
+        mock_market_config,
+        scheduled=300.0,
+        accepted=120.0,
+        accepted_price=90.0,
+    )
+    assert regret == pytest.approx(0.1 * (90.0 - 40.0) * 180.0 * 1.0)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_zero_when_price_below_stored_cost(
+    mock_market_config, storage_unit
+):
+    *_, regret, _ = _regret_step(
+        storage_unit,
+        mock_market_config,
+        scheduled=300.0,
+        accepted=0.0,
+        stored_cost=150.0,
+    )
+    assert regret == 0.0
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_zero_when_charging(mock_market_config, storage_unit):
+    *_, bid, _, regret, active = _regret_step(
+        storage_unit, mock_market_config, scheduled=-300.0, accepted=0.0
+    )
+    assert bid["volume"] < 0
+    assert regret == 0.0
+    assert active == 0.0
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_zero_for_foreign_unit(
+    mock_market_config, storage_unit
+):
+    index = _set_schedule(storage_unit, [300.0, 0.0, 0.0], prices=100.0)
+    storage_unit.forecaster.is_foreign = True
+    strategy = _schedule_learning_strategy(storage_unit)
+    bids = [
+        {
+            "start_time": index[0],
+            "end_time": index[1],
+            "volume": 300.0,
+            "accepted_volume": 0.0,
+            "accepted_price": 0.0,
+        }
+    ]
+    assert strategy._regret(storage_unit, mock_market_config, bids, index[0], 1.0) == 0
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_regret_measured_against_schedule(
+    mock_market_config, storage_unit
+):
+    # SoC 0.1 of 1000 MWh at 0.9 efficiency caps the bid at 90 MW.
+    *_, bid, _, regret, _ = _regret_step(
+        storage_unit,
+        mock_market_config,
+        scheduled=300.0,
+        accepted="all",
+        accepted_price=100.0,
+        soc=0.1,
+    )
+    assert bid["volume"] == pytest.approx(90.0)
+    assert regret == pytest.approx(0.1 * 60.0 * (300.0 - 90.0) * 1.0)
+
+
+@pytest.mark.require_learning
+@pytest.mark.parametrize(
+    "params, match",
+    [
+        ({"regret_weight": None}, "requires 'regret_weight'"),
+        ({"regret_scale_dispatched": None}, "requires 'regret_scale_dispatched'"),
+        ({"regret_scale_idle": None}, "requires 'regret_scale_idle'"),
+        ({"regret_weight": -1.0}, "regret_weight must be a finite non-negative"),
+        ({"regret_scale_idle": float("nan")}, "regret_scale_idle must be a finite"),
+        ({"regret_scale_dispatched": float("inf")}, "regret_scale_dispatched"),
+        ({"regret_weight": "high"}, "regret_weight must be a number"),
+    ],
+)
+def test_schedule_dispatch_validates_regret_params(storage_unit, params, match):
+    with pytest.raises(ValueError, match=match):
+        _schedule_learning_strategy(storage_unit, **params)
+
+
+@pytest.mark.require_learning
+def test_storage_learning_base_reward_has_no_regret(mock_market_config, storage_unit):
+    """An unaccepted sell in the base strategy still scores 0 with 0 regret."""
+    start = pd.Timestamp("2023-07-01")
+    strategy = storage_unit.bidding_strategies["test_market"]
+    storage_unit.outputs["cost_stored_energy"].at[start] = 40.0
+    with patch.object(
+        StorageEnergyLearningStrategy,
+        "get_actions",
+        return_value=(th.tensor([0.5]), th.tensor(0.0)),
+    ):
+        bids = strategy.calculate_bids(
+            storage_unit,
+            mock_market_config,
+            [(start, start + pd.Timedelta(hours=1), None)],
+        )
+    bids[0]["accepted_volume"] = 0.0
+    bids[0]["accepted_price"] = 0.0
+    strategy.calculate_reward(storage_unit, mock_market_config, bids)
+
+    role = strategy.learning_role
+    assert role.all_rewards[start][storage_unit.id] == [0.0]
+    assert role.all_regrets[start][storage_unit.id] == [0]
+    assert role.all_profits[start][storage_unit.id] == [0.0]
 
 
 @pytest.mark.require_learning
