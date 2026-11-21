@@ -493,6 +493,9 @@ class SupportsMinMaxCharge(BaseUnit):
     capacity: float
     efficiency_charge: float
     efficiency_discharge: float
+    # optional SoC trajectory (SoC at the start of each step); when set, the SoC
+    # follows it regardless of the dispatched power
+    soc_lock: FastSeries | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -500,6 +503,12 @@ class SupportsMinMaxCharge(BaseUnit):
         for strategy in bidding_strategies.values():
             if not isinstance(strategy, MinMaxChargeStrategy):
                 raise ValueError(f"strategy {strategy} is not a MinMaxChargeStrategy!")
+
+    def next_soc(self, next_t: datetime, physical_soc: float) -> float:
+        """Return the SoC at ``next_t``: the locked value if a lock is set."""
+        if self.soc_lock is None:
+            return physical_soc
+        return float(self.soc_lock.at[next_t])
 
     def calculate_min_max_charge(
         self, start: datetime, end: datetime, soc: float = None
@@ -677,7 +686,7 @@ class SupportsMinMaxCharge(BaseUnit):
                 ) / self.capacity
 
             # update the values of the state of charge and the energy
-            self.outputs["soc"].at[next_t] = soc + delta_soc
+            self.outputs["soc"].at[next_t] = self.next_soc(next_t, soc + delta_soc)
             self.outputs["energy"].at[t] = current_power
 
 

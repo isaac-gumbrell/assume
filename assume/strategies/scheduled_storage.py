@@ -9,7 +9,11 @@ import numpy as np
 from assume.common.base import MinMaxChargeStrategy, SupportsMinMaxCharge
 from assume.common.fast_pandas import FastSeries
 from assume.common.market_objects import MarketConfig, Orderbook, Product
-from assume.common.storage_schedule import schedule_column, validate_storage_schedule
+from assume.common.storage_schedule import (
+    replay_schedule_soc,
+    schedule_column,
+    validate_storage_schedule,
+)
 from assume.strategies.flexable_storage import StorageEnergyHeuristicFlexableStrategy
 
 
@@ -65,6 +69,24 @@ class StorageScheduleMixin:
             validate_storage_schedule(unit, schedule.data, self.schedule_tolerance)
             self._validated_schedules[unit.id] = schedule
         return schedule
+
+    def _schedule_soc(
+        self, unit: SupportsMinMaxCharge, schedule: FastSeries
+    ) -> FastSeries:
+        """Return the SoC at the start of each step if ``schedule`` is executed."""
+        duration_hours = unit.index.freq / timedelta(hours=1)
+        soc = replay_schedule_soc(
+            schedule.data,
+            unit.initial_soc,
+            unit.capacity,
+            unit.efficiency_charge,
+            unit.efficiency_discharge,
+            duration_hours,
+            unit.min_soc,
+            unit.max_soc,
+            self.schedule_tolerance * duration_hours / unit.capacity,
+        )
+        return FastSeries(index=unit.index, value=soc[:-1])
 
     def _scheduled_power(self, unit: SupportsMinMaxCharge, start: datetime) -> float:
         power = float(self._unit_schedule(unit).at[start])

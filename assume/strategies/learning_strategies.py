@@ -2487,11 +2487,14 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
     """Storage following an exogenous schedule, with an RL discharge markup.
 
     Mode and volume come from the unit's ``storage_schedule_{unit_id}`` column in
-    forecasts_df instead of the heuristic. The schedule acts as a cap: discharge is
-    ``min(schedule, feasible)`` and charging is ``min(|schedule|, headroom)``. When a
-    markup withholds energy, the SoC stays above the schedule and later charging is
-    reduced until the SoC meets the schedule again. Shortfalls against the schedule
-    are recorded in the unit output ``schedule_deviation`` (MW, scheduled minus bid).
+    forecasts_df instead of the heuristic. Discharge is ``min(schedule, feasible)``
+    and charging is ``min(|schedule|, headroom)``.
+
+    The SoC is locked to the schedule (``unit.soc_lock``): after every step it equals
+    the SoC the schedule implies, whatever cleared. Energy withheld by a markup is
+    forfeited ("use it or lose it"), and the lost stored-energy value shows up in the
+    reward through the inventory term. Charging likewise follows the schedule. The
+    unit output ``schedule_deviation`` records scheduled minus cleared MW.
 
     Discharge prices map the action from ``schedule_discharge_price`` (action -1,
     identical to :class:`~assume.strategies.scheduled_storage.StorageEnergyFixedScheduleStrategy`)
@@ -2558,6 +2561,7 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
                     f"{name} must be a finite non-negative number, got {value}."
                 )
             setattr(self, name, value)
+        self._soc_locked_schedules: dict[str, FastSeries] = {}
         if self.schedule_discharge_price > self.max_bid_price:
             raise ValueError(
                 "schedule_discharge_price must not exceed max_bid_price, got "
@@ -2576,6 +2580,29 @@ class StorageEnergyLearningScheduleDispatchStrategyCongestion(
         heuristic_schedule_price_source: str,
     ) -> None:
         return None
+
+    def _unit_schedule(self, unit: SupportsMinMaxCharge) -> FastSeries:
+        schedule = super()._unit_schedule(unit)
+        if self._soc_locked_schedules.get(unit.id) is not schedule:
+            unit.soc_lock = self._schedule_soc(unit, schedule)
+            self._soc_locked_schedules[unit.id] = schedule
+        return schedule
+
+    def calculate_reward(
+        self,
+        unit: SupportsMinMaxCharge,
+        marketconfig: MarketConfig,
+        orderbook: Orderbook,
+    ):
+        super().calculate_reward(unit, marketconfig, orderbook)
+        for order in orderbook:
+            start = order["start_time"]
+            accepted = self._scalar_order_value(
+                order.get("accepted_volume", 0), "accepted_volume"
+            )
+            unit.outputs["schedule_deviation"].at[start] = (
+                self._scheduled_power(unit, start) - accepted
+            )
 
     def _mode_and_volume_bids(
         self,

@@ -334,6 +334,10 @@ def test_schedule_dispatch_learning_smoke(raw_run):
     assert (battery[scheduled == 0].abs() <= 1e-3).all()
     soc = series(evaluated, "battery", "soc")
     assert soc.between(-1e-6, 1 + 1e-6).all()
+    # The SoC is locked to the schedule, i.e. to the raw run that produced it.
+    np.testing.assert_allclose(
+        soc, series(raw, "battery", "soc").reindex(soc.index), atol=1e-3
+    )
     assert deviation.notna().all()
 
 

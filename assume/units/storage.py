@@ -334,7 +334,9 @@ class Storage(SupportsMinMaxCharge):
             # update the values of the state of charge and the energy
             next_freq = t + self.index.freq
             if next_freq in self.index:
-                self.outputs["soc"].at[next_freq] = soc + delta_soc
+                self.outputs["soc"].at[next_freq] = self.next_soc(
+                    next_freq, soc + delta_soc
+                )
             self.outputs["energy"].at[t] = current_power
 
         return self.outputs["energy"].loc[start:end]

@@ -324,7 +324,7 @@ def test_schedule_dispatch_lowest_action_reproduces_fixed_schedule_bids(
 
 
 @pytest.mark.require_learning
-def test_schedule_dispatch_markup_withholds_and_resyncs(
+def test_schedule_dispatch_withheld_energy_is_forfeited(
     mock_market_config, storage_unit
 ):
     # initial SoC 0.5 of 1000 MWh; efficiencies 0.9
@@ -342,25 +342,47 @@ def test_schedule_dispatch_markup_withholds_and_resyncs(
     assert strategy._rl_active_by_start[index[0]]
     _clear(storage_unit, strategy, mock_market_config, bids, 0.0)  # withheld
 
-    soc_after_withholding = storage_unit.outputs["soc"].at[index[1]]
-    assert soc_after_withholding == pytest.approx(0.5)
+    # The SoC follows the schedule although nothing was dispatched.
+    assert storage_unit.outputs["energy"].at[index[0]] == 0.0
+    assert storage_unit.outputs["soc"].at[index[1]] == pytest.approx(0.1)
 
-    # The first charge fills the battery, so the second scheduled charge is cut.
-    charged = []
+    # Both scheduled charges therefore run in full.
     for start in index[1:3]:
         products = [(start, start + pd.Timedelta(hours=1), None)]
         bids = strategy.calculate_bids(storage_unit, mock_market_config, products)
         assert not strategy._rl_active_by_start[start]
         assert bids[0]["price"] == 10_000.0
-        charged.append(bids[0]["volume"])
+        assert bids[0]["volume"] == pytest.approx(-500.0)
         _clear(storage_unit, strategy, mock_market_config, bids, bids[0]["volume"])
 
-    assert charged[0] == pytest.approx(-500.0)
-    assert charged[1] == pytest.approx(-(1 - 0.95) * 1000 / 0.9)
-    assert storage_unit.outputs["soc"].at[index[3]] == pytest.approx(1.0)
+    soc = storage_unit.outputs["soc"]
+    assert soc.at[index[2]] == pytest.approx(0.55)
+    assert soc.at[index[3]] == pytest.approx(1.0)
     deviation = storage_unit.outputs["schedule_deviation"]
-    assert deviation.at[index[0]] == pytest.approx(0.0)
-    assert deviation.at[index[2]] == pytest.approx(-500.0 - charged[1])
+    assert deviation.at[index[0]] == pytest.approx(360.0)
+    assert deviation.at[index[1]] == pytest.approx(0.0)
+    assert deviation.at[index[2]] == pytest.approx(0.0)
+
+
+@pytest.mark.require_learning
+def test_schedule_dispatch_soc_lock_survives_dispatch_execution(
+    mock_market_config, storage_unit
+):
+    index = _set_schedule(storage_unit, [360.0, 0.0, 0.0], prices=100.0)
+    strategy = _schedule_learning_strategy(storage_unit)
+    bids = strategy.calculate_bids(
+        storage_unit, mock_market_config, [(index[0], index[1], None)]
+    )
+    _clear(storage_unit, strategy, mock_market_config, bids, 120.0)
+
+    # Re-executing the whole horizon (as the units operator does) keeps the lock.
+    storage_unit.execute_current_dispatch(index[0], index[-1])
+    assert storage_unit.outputs["energy"].at[index[0]] == pytest.approx(120.0)
+    assert storage_unit.outputs["soc"].at[index[1]] == pytest.approx(0.1)
+    assert storage_unit.outputs["soc"].at[index[2]] == pytest.approx(0.1)
+    assert storage_unit.outputs["schedule_deviation"].at[index[0]] == pytest.approx(
+        240.0
+    )
 
 
 @pytest.mark.require_learning
@@ -439,7 +461,12 @@ def test_schedule_dispatch_regret_unaccepted_discharge(
     )
     # rejected order: price falls back to the forecast (100), margin 100 - 40
     assert regret == pytest.approx(0.5 * 60.0 * 300.0 * 1.0)
-    assert reward == pytest.approx(-regret * _reward_scale(strategy, storage_unit))
+    # the SoC is locked to the schedule, so the withheld energy (valued at the
+    # stored cost of 40) is lost as well
+    forfeited_value = 40.0 * 300.0 / 0.9
+    assert reward == pytest.approx(
+        -(regret + forfeited_value) * _reward_scale(strategy, storage_unit)
+    )
     assert active == 1.0
 
     *_, reward_without, regret_without, _ = _regret_step(
